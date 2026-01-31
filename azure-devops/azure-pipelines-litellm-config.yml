@@ -1,0 +1,295 @@
+# Azure Pipeline: Sync LiteLLM Configuration to Database
+# Purpose:
+#   - Read config.yaml from GitHub
+#   - Sync model definitions to LiteLLM PostgreSQL database via API
+#   - Keep database in sync with GitHub config
+# Trigger: Automatic on config.yaml changes or manual
+
+trigger:
+  branches:
+    include:
+    - master
+    - main
+  paths:
+    include:
+    - config.yaml
+
+parameters:
+- name: environment
+  displayName: 'Environment'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+- name: removeOldModels
+  displayName: 'Remove models not in config.yaml'
+  type: string
+  default: 'false'
+  values:
+  - 'true'
+  - 'false'
+
+variables:
+- group: litellm-aws-config
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: SyncConfig
+  displayName: 'Sync Configuration to Database'
+  jobs:
+  - job: SyncModels
+    displayName: 'Sync Models to LiteLLM Database'
+    steps:
+    - checkout: self
+      displayName: 'Checkout repository'
+
+    - task: AWSShellScript@1
+      displayName: 'Parse config.yaml and Sync to Database'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+
+          echo "=========================================="
+          echo "LiteLLM Configuration Sync"
+          echo "=========================================="
+          echo "Environment: ${{ parameters.environment }}"
+          echo "Config file: config.yaml"
+          echo ""
+
+          # Get ALB DNS
+          ALB_DNS=$(aws cloudformation describe-stacks \
+            --stack-name ${{ parameters.environment }}-alb-stack \
+            --region ${{ parameters.awsRegion }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerDNSName`].OutputValue' \
+            --output text)
+
+          ALB_URL="http://$ALB_DNS"
+          echo "LiteLLM API: $ALB_URL"
+          echo ""
+
+          # Get master key
+          MASTER_KEY=$(aws secretsmanager get-secret-value \
+            --secret-id ${{ parameters.environment }}/litellm/master-key \
+            --region ${{ parameters.awsRegion }} \
+            --query 'SecretString' \
+            --output text | jq -r '.LITELLM_MASTER_KEY')
+
+          echo "✓ Credentials retrieved"
+          echo ""
+
+          # Validate config.yaml exists
+          if [ ! -f "config.yaml" ]; then
+            echo "❌ ERROR: config.yaml not found"
+            exit 1
+          fi
+
+          # Install yq for YAML parsing if needed
+          if ! command -v yq &> /dev/null; then
+            echo "Installing yq..."
+            wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            chmod +x /usr/local/bin/yq
+          fi
+
+          echo "=========================================="
+          echo "Parsing config.yaml"
+          echo "=========================================="
+
+          # Count models in config
+          MODEL_COUNT=$(yq '.model_list | length' config.yaml)
+          echo "Models in config.yaml: $MODEL_COUNT"
+          echo ""
+
+          # Get current models from database
+          echo "Fetching current models from database..."
+          CURRENT_MODELS=$(curl -s "$ALB_URL/model/info" \
+            -H "Authorization: Bearer $MASTER_KEY" | jq -r '.data[].model_name' 2>/dev/null || echo "")
+
+          if [ -n "$CURRENT_MODELS" ]; then
+            echo "Current models in database:"
+            echo "$CURRENT_MODELS" | sed 's/^/  - /'
+          else
+            echo "No models currently in database"
+          fi
+          echo ""
+
+          echo "=========================================="
+          echo "Syncing Models to Database"
+          echo "=========================================="
+          echo ""
+
+          SUCCESS_COUNT=0
+          ERROR_COUNT=0
+
+          # Process each model in config.yaml
+          for i in $(seq 0 $(($MODEL_COUNT - 1))); do
+            MODEL_NAME=$(yq ".model_list[$i].model_name" config.yaml)
+            LITELLM_MODEL=$(yq ".model_list[$i].litellm_params.model" config.yaml)
+            AWS_REGION=$(yq ".model_list[$i].litellm_params.aws_region_name" config.yaml)
+
+            echo "[$((i+1))/$MODEL_COUNT] Processing: $MODEL_NAME"
+            echo "  LiteLLM Model: $LITELLM_MODEL"
+            echo "  AWS Region: $AWS_REGION"
+
+            # Check if model already exists
+            MODEL_EXISTS=$(echo "$CURRENT_MODELS" | grep -x "$MODEL_NAME" || true)
+
+            if [ -n "$MODEL_EXISTS" ]; then
+              echo "  → Model exists, updating..."
+
+              # Update existing model
+              RESPONSE=$(curl -s -X POST "$ALB_URL/model/update" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $MASTER_KEY" \
+                -d "{
+                  \"model_name\": \"$MODEL_NAME\",
+                  \"litellm_params\": {
+                    \"model\": \"$LITELLM_MODEL\",
+                    \"aws_region_name\": \"$AWS_REGION\"
+                  }
+                }" || echo '{"error": "request failed"}')
+
+              if echo "$RESPONSE" | jq -e '.model_name' > /dev/null 2>&1; then
+                echo "  ✓ Updated successfully"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              else
+                echo "  ⚠️  Update failed: $(echo $RESPONSE | jq -r '.error // .detail // "Unknown error"')"
+                ERROR_COUNT=$((ERROR_COUNT + 1))
+              fi
+            else
+              echo "  → Model doesn't exist, creating..."
+
+              # Create new model
+              RESPONSE=$(curl -s -X POST "$ALB_URL/model/new" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $MASTER_KEY" \
+                -d "{
+                  \"model_name\": \"$MODEL_NAME\",
+                  \"litellm_params\": {
+                    \"model\": \"$LITELLM_MODEL\",
+                    \"aws_region_name\": \"$AWS_REGION\"
+                  }
+                }" || echo '{"error": "request failed"}')
+
+              if echo "$RESPONSE" | jq -e '.model_name' > /dev/null 2>&1; then
+                echo "  ✓ Created successfully"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              else
+                echo "  ⚠️  Creation failed: $(echo $RESPONSE | jq -r '.error // .detail // "Unknown error"')"
+                ERROR_COUNT=$((ERROR_COUNT + 1))
+              fi
+            fi
+            echo ""
+          done
+
+          # Optional: Remove models not in config.yaml
+          if [ "${{ parameters.removeOldModels }}" = "true" ]; then
+            echo "=========================================="
+            echo "Removing Models Not in Config"
+            echo "=========================================="
+            echo ""
+
+            # Get models in config
+            CONFIG_MODELS=$(yq '.model_list[].model_name' config.yaml)
+
+            # Check each current model
+            for MODEL in $CURRENT_MODELS; do
+              IN_CONFIG=$(echo "$CONFIG_MODELS" | grep -x "$MODEL" || true)
+
+              if [ -z "$IN_CONFIG" ]; then
+                echo "Removing obsolete model: $MODEL"
+
+                RESPONSE=$(curl -s -X POST "$ALB_URL/model/delete" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer $MASTER_KEY" \
+                  -d "{\"id\": \"$MODEL\"}" || echo '{"error": "request failed"}')
+
+                if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
+                  echo "  ✓ Removed"
+                else
+                  echo "  ⚠️  Removal failed"
+                fi
+                echo ""
+              fi
+            done
+          fi
+
+          echo "=========================================="
+          echo "Sync Summary"
+          echo "=========================================="
+          echo "Successful: $SUCCESS_COUNT"
+          echo "Errors: $ERROR_COUNT"
+          echo ""
+
+          if [ $ERROR_COUNT -gt 0 ]; then
+            echo "⚠️  Some models failed to sync"
+            exit 0  # Don't fail pipeline, just warn
+          else
+            echo "✓ All models synced successfully"
+          fi
+
+- stage: VerifySync
+  displayName: 'Verify Configuration Sync'
+  dependsOn: SyncConfig
+  jobs:
+  - job: VerifyModels
+    displayName: 'Verify Models Available'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Verify Models Endpoint'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "Verification"
+          echo "=========================================="
+          echo ""
+
+          # Get ALB DNS
+          ALB_DNS=$(aws cloudformation describe-stacks \
+            --stack-name ${{ parameters.environment }}-alb-stack \
+            --region ${{ parameters.awsRegion }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerDNSName`].OutputValue' \
+            --output text)
+
+          ALB_URL="http://$ALB_DNS"
+
+          # Get master key
+          MASTER_KEY=$(aws secretsmanager get-secret-value \
+            --secret-id ${{ parameters.environment }}/litellm/master-key \
+            --region ${{ parameters.awsRegion }} \
+            --query 'SecretString' \
+            --output text | jq -r '.LITELLM_MASTER_KEY')
+
+          # Check models endpoint
+          echo "Available models via API:"
+          curl -s "$ALB_URL/v1/models" \
+            -H "Authorization: Bearer $MASTER_KEY" | jq '.data[].id' | sed 's/"//g' | sed 's/^/  - /'
+
+          echo ""
+          echo "=========================================="
+          echo "Configuration Sync Complete"
+          echo "=========================================="
+          echo ""
+          echo "Next Steps:"
+          echo "1. Test API: curl $ALB_URL/v1/models"
+          echo "2. Test chat: curl -X POST $ALB_URL/v1/chat/completions"
+          echo "3. To update: Edit config.yaml in GitHub and push"
+          echo ""
+          echo "=========================================="

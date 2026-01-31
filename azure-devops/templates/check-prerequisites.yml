@@ -1,0 +1,55 @@
+# Template: Check CloudFormation Stack Prerequisites
+# Verifies that required CloudFormation stacks exist before proceeding
+
+parameters:
+- name: requiredStacks
+  type: object
+  default: []
+- name: awsRegion
+  type: string
+  default: 'us-east-1'
+- name: awsServiceConnection
+  type: string
+  default: 'aws-litellm-connection'
+
+steps:
+- ${{ each stack in parameters.requiredStacks }}:
+  - task: AWSShellScript@1
+    displayName: 'Check ${{ stack }} exists'
+    inputs:
+      awsCredentials: '${{ parameters.awsServiceConnection }}'
+      regionName: '${{ parameters.awsRegion }}'
+      scriptType: 'inline'
+      inlineScript: |
+        echo "Checking if CloudFormation stack '${{ stack }}' exists..."
+
+        if aws cloudformation describe-stacks --stack-name ${{ stack }} --region ${{ parameters.awsRegion }} >/dev/null 2>&1; then
+          echo "✓ Stack '${{ stack }}' found"
+
+          # Check stack status
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name ${{ stack }} \
+            --region ${{ parameters.awsRegion }} \
+            --query 'Stacks[0].StackStatus' \
+            --output text)
+
+          echo "Stack status: $STACK_STATUS"
+
+          if [[ "$STACK_STATUS" == *"ROLLBACK"* ]] || [[ "$STACK_STATUS" == *"FAILED"* ]]; then
+            echo "❌ Stack '${{ stack }}' is in a failed state: $STACK_STATUS"
+            exit 1
+          elif [[ "$STACK_STATUS" == *"IN_PROGRESS"* ]]; then
+            echo "⚠️  Stack '${{ stack }}' is currently being updated: $STACK_STATUS"
+            echo "Waiting for stack operation to complete..."
+            exit 1
+          elif [[ "$STACK_STATUS" == "CREATE_COMPLETE" ]] || [[ "$STACK_STATUS" == "UPDATE_COMPLETE" ]]; then
+            echo "✓ Stack '${{ stack }}' is ready"
+          else
+            echo "⚠️  Stack '${{ stack }}' status: $STACK_STATUS"
+          fi
+        else
+          echo "❌ Required stack '${{ stack }}' does not exist"
+          echo "Please deploy the '${{ stack }}' stack first"
+          exit 1
+        fi
+      failOnStderr: false

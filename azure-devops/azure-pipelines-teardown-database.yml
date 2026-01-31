@@ -1,0 +1,192 @@
+# Azure Pipeline: Teardown Database Stack
+# Deletes: RDS PostgreSQL instance, DB subnet group, parameter group, security updates
+
+trigger: none
+
+parameters:
+- name: environment
+  displayName: 'Environment'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+- name: confirmDelete
+  displayName: 'Type DELETE to confirm'
+  type: string
+  default: ''
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: litellm-aws-config
+  - group: litellm-aws-secrets
+
+stages:
+- stage: Validate
+  displayName: 'Validate Deletion'
+  jobs:
+  - job: ValidateConfirmation
+    displayName: 'Validate Confirmation'
+    steps:
+    - checkout: none
+
+    - bash: |
+        if [ "${{ parameters.confirmDelete }}" != "DELETE" ]; then
+          echo "❌ Confirmation failed"
+          echo "You must type 'DELETE' to confirm stack deletion"
+          exit 1
+        fi
+        echo "✓ Deletion confirmed"
+      displayName: 'Confirm deletion'
+
+- stage: TeardownDatabase
+  displayName: 'Teardown Database Stack'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: DeleteDatabase
+    displayName: 'Delete Database Stack'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete Database Stack'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          STACK_NAME="${{ parameters.environment }}-database-stack"
+
+          echo "=========================================="
+          echo "Deleting Database Stack"
+          echo "=========================================="
+          echo "Stack Name: $STACK_NAME"
+          echo "Region: ${{ parameters.awsRegion }}"
+          echo "=========================================="
+
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME 2>/dev/null; then
+            echo "Stack exists, proceeding with deletion..."
+
+            # Get stack resources for cleanup verification
+            echo ""
+            echo "Stack resources to be deleted:"
+            aws cloudformation list-stack-resources \
+              --stack-name $STACK_NAME \
+              --query 'StackResourceSummaries[*].[ResourceType,LogicalResourceId]' \
+              --output table
+
+            # Get DB instance details
+            DB_INSTANCE=$(aws cloudformation describe-stack-resources \
+              --stack-name $STACK_NAME \
+              --query "StackResources[?ResourceType=='AWS::RDS::DBInstance'].PhysicalResourceId" \
+              --output text 2>/dev/null)
+
+            if [ -n "$DB_INSTANCE" ]; then
+              echo ""
+              echo "⚠️  Note: RDS instance detected: $DB_INSTANCE"
+
+              # Check if deletion protection is enabled
+              DELETION_PROTECTION=$(aws rds describe-db-instances \
+                --db-instance-identifier $DB_INSTANCE \
+                --query 'DBInstances[0].DeletionProtection' \
+                --output text 2>/dev/null)
+
+              if [ "$DELETION_PROTECTION" = "True" ]; then
+                echo "Deletion protection is enabled, disabling..."
+                aws rds modify-db-instance \
+                  --db-instance-identifier $DB_INSTANCE \
+                  --no-deletion-protection \
+                  --apply-immediately \
+                  --region ${{ parameters.awsRegion }} >/dev/null 2>&1 || true
+                echo "Waiting for modification to apply..."
+                sleep 10
+              fi
+
+              echo "Database deletion will take 10-15 minutes"
+            fi
+
+            # Delete the stack
+            echo ""
+            echo "Initiating stack deletion..."
+            aws cloudformation delete-stack --stack-name $STACK_NAME
+
+            # Wait for deletion to complete
+            echo "Waiting for stack deletion to complete..."
+            echo "(This typically takes 10-15 minutes for RDS deletion)"
+            aws cloudformation wait stack-delete-complete \
+              --stack-name $STACK_NAME \
+              --region ${{ parameters.awsRegion }}
+
+            echo ""
+            echo "=========================================="
+            echo "✓ $STACK_NAME deleted successfully"
+            echo "=========================================="
+
+            # Verify deletion
+            echo ""
+            echo "Verifying cleanup..."
+
+            # Check for orphaned DB instances
+            DBS=$(aws rds describe-db-instances \
+              --query "DBInstances[?contains(DBInstanceIdentifier, '${{ parameters.environment }}-litellm')].DBInstanceIdentifier" \
+              --output text 2>/dev/null)
+
+            if [ -n "$DBS" ]; then
+              echo "⚠️  Warning: Found orphaned DB instances: $DBS"
+              echo "These should be manually cleaned up if not in use"
+            else
+              echo "✓ No orphaned DB instances found"
+            fi
+
+            # Check for orphaned DB snapshots
+            SNAPSHOTS=$(aws rds describe-db-snapshots \
+              --query "DBSnapshots[?contains(DBSnapshotIdentifier, '${{ parameters.environment }}-litellm')].DBSnapshotIdentifier" \
+              --output text 2>/dev/null)
+
+            if [ -n "$SNAPSHOTS" ]; then
+              echo "⚠️  Note: Found DB snapshots: $SNAPSHOTS"
+              echo "Snapshots are retained for backup purposes"
+              echo "Delete manually if no longer needed to avoid storage charges"
+            else
+              echo "✓ No DB snapshots found"
+            fi
+
+          else
+            echo "Stack $STACK_NAME does not exist"
+            echo "Nothing to delete"
+          fi
+        failOnStderr: false
+        timeoutInMinutes: 30
+
+    - bash: |
+        echo ""
+        echo "=========================================="
+        echo "Database Stack Teardown Complete"
+        echo "=========================================="
+        echo ""
+        echo "Deleted resources:"
+        echo "  - RDS PostgreSQL instance"
+        echo "  - DB subnet group"
+        echo "  - DB parameter group"
+        echo "  - Security groups"
+        echo "  - CloudWatch alarms"
+        echo ""
+        echo "Important notes:"
+        echo "  - DB snapshots may be retained for backup"
+        echo "  - Delete snapshots manually if no longer needed"
+        echo ""
+        echo "Next steps:"
+        echo "  - LiteLLM stack (if deployed) should be deleted first"
+        echo "  - Network, ALB, and Security stacks can be torn down after Database"
+        echo ""
+      displayName: 'Teardown summary'

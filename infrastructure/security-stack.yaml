@@ -1,0 +1,661 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  LiteLLM Security Stack - KMS Keys, Secrets Manager, Rotation Lambdas, IAM Roles
+  Owner: Security Team
+  Deploy Order: 1 (first)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  SecretRotationDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days between automatic secret rotation
+
+  CostCenter:
+    Type: String
+    Default: engineering
+    Description: Cost center for billing allocation and chargeback
+
+  Owner:
+    Type: String
+    Default: DevTeam
+    Description: Team or person responsible for this resource
+
+  Project:
+    Type: String
+    Default: litellm-proxy
+    Description: Project identifier for cost tracking and resource organization
+
+  Compliance:
+    Type: String
+    Default: None
+    AllowedValues:
+      - None
+      - HIPAA
+      - PCI
+      - SOC2
+      - GDPR
+    Description: Compliance classification for this environment
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  #############################################################################
+  # KMS Key for encrypting all secrets and RDS
+  #############################################################################
+  LiteLLMEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for LiteLLM ${Environment} environment encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowSecretsManagerUse
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+          - Sid: AllowRDSUse
+            Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+          - Sid: AllowLambdaUse
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-encryption-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  LiteLLMEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${Environment}-litellm-key'
+      TargetKeyId: !Ref LiteLLMEncryptionKey
+
+  #############################################################################
+  # Secrets Manager - Master Key
+  #############################################################################
+  MasterKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${Environment}/litellm/master-key'
+      Description: LiteLLM Master Key for API authentication
+      KmsKeyId: !Ref LiteLLMEncryptionKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"version": "1", "rotated": "false"}'
+        GenerateStringKey: LITELLM_MASTER_KEY
+        PasswordLength: 48
+        ExcludeCharacters: '"@/\'
+        RequireEachIncludedType: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-master-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: RotationEnabled
+          Value: 'true'
+
+  #############################################################################
+  # Secrets Manager - API Keys (OpenAI, Anthropic, etc.)
+  #############################################################################
+  ApiKeysSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${Environment}/litellm/api-keys'
+      Description: External LLM API keys (OpenAI, Anthropic, etc.)
+      KmsKeyId: !Ref LiteLLMEncryptionKey
+      SecretString: !Sub |
+        {
+          "OPENAI_API_KEY": "sk-placeholder-replace-me",
+          "OPENAI_API_KEY_SECONDARY": "",
+          "ANTHROPIC_API_KEY": "sk-ant-placeholder-replace-me",
+          "ANTHROPIC_API_KEY_SECONDARY": "",
+          "AWS_BEDROCK_REGION": "${AWS::Region}"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-api-keys'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: RotationEnabled
+          Value: 'manual'
+
+  #############################################################################
+  # Secrets Manager - Database Credentials
+  #############################################################################
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${Environment}/litellm/database'
+      Description: LiteLLM PostgreSQL database credentials
+      KmsKeyId: !Ref LiteLLMEncryptionKey
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "litellm_admin", "dbname": "litellm", "port": 5432}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'''
+        RequireEachIncludedType: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-database'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: RotationEnabled
+          Value: 'true'
+
+  #############################################################################
+  # Master Key Rotation Lambda
+  #############################################################################
+  MasterKeyRotationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-litellm-master-key-rotation-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MasterKeyRotationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsManagerRotation
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:UpdateSecretVersionStage
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref MasterKeySecret
+              - Sid: GeneratePassword
+                Effect: Allow
+                Action: secretsmanager:GetRandomPassword
+                Resource: '*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Environment}-litellm-master-key-rotation:*'
+              - Sid: KMSDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt LiteLLMEncryptionKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-master-key-rotation-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  MasterKeyRotationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-litellm-master-key-rotation'
+      Description: Rotates LiteLLM master key with grace period support
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt MasterKeyRotationRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          GRACE_PERIOD_DAYS: '7'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import secrets
+          import string
+          from datetime import datetime, timedelta
+
+          def lambda_handler(event, context):
+              """
+              Rotates LiteLLM master key with grace period support.
+              Preserves the previous key for 7 days to allow clients to update.
+              """
+              arn = event['SecretId']
+              token = event['ClientRequestToken']
+              step = event['Step']
+
+              secrets_client = boto3.client('secretsmanager')
+
+              if step == 'createSecret':
+                  create_secret(secrets_client, arn, token)
+              elif step == 'setSecret':
+                  # No external system to update for master key
+                  pass
+              elif step == 'testSecret':
+                  # Verify the new secret can be retrieved
+                  test_secret(secrets_client, arn, token)
+              elif step == 'finishSecret':
+                  finish_secret(secrets_client, arn, token)
+              else:
+                  raise ValueError(f"Invalid step: {step}")
+
+              return {"statusCode": 200}
+
+          def create_secret(client, arn, token):
+              """Generate new master key, preserve old key for grace period."""
+              # Get current secret
+              current = client.get_secret_value(SecretId=arn, VersionStage='AWSCURRENT')
+              current_secret = json.loads(current['SecretString'])
+
+              # Generate new master key (sk-litellm-xxxx format)
+              alphabet = string.ascii_letters + string.digits
+              random_part = ''.join(secrets.choice(alphabet) for _ in range(44))
+              new_key = f"sk-litellm-{random_part}"
+
+              # Preserve previous key for grace period
+              grace_days = int(os.environ.get('GRACE_PERIOD_DAYS', 7))
+              grace_until = (datetime.utcnow() + timedelta(days=grace_days)).isoformat() + 'Z'
+
+              new_secret = {
+                  'LITELLM_MASTER_KEY': new_key,
+                  'LITELLM_MASTER_KEY_PREVIOUS': current_secret.get('LITELLM_MASTER_KEY', ''),
+                  'version': str(int(current_secret.get('version', 0)) + 1),
+                  'rotated': 'true',
+                  'rotated_at': datetime.utcnow().isoformat() + 'Z',
+                  'previous_valid_until': grace_until
+              }
+
+              # Store new secret as pending
+              try:
+                  client.put_secret_value(
+                      SecretId=arn,
+                      ClientRequestToken=token,
+                      SecretString=json.dumps(new_secret),
+                      VersionStages=['AWSPENDING']
+                  )
+              except client.exceptions.ResourceExistsException:
+                  # Secret version already exists
+                  pass
+
+          def test_secret(client, arn, token):
+              """Verify the new secret is valid."""
+              pending = client.get_secret_value(
+                  SecretId=arn,
+                  VersionId=token,
+                  VersionStage='AWSPENDING'
+              )
+              secret = json.loads(pending['SecretString'])
+
+              # Verify required fields exist
+              if 'LITELLM_MASTER_KEY' not in secret:
+                  raise ValueError("New secret missing LITELLM_MASTER_KEY")
+              if not secret['LITELLM_MASTER_KEY'].startswith('sk-litellm-'):
+                  raise ValueError("Invalid master key format")
+
+          def finish_secret(client, arn, token):
+              """Finalize the rotation by updating version stages."""
+              metadata = client.describe_secret(SecretId=arn)
+
+              # Find the current version
+              current_version = None
+              for version_id, stages in metadata['VersionIdsToStages'].items():
+                  if 'AWSCURRENT' in stages:
+                      current_version = version_id
+                      break
+
+              # Move AWSCURRENT to the new version
+              client.update_secret_version_stage(
+                  SecretId=arn,
+                  VersionStage='AWSCURRENT',
+                  MoveToVersionId=token,
+                  RemoveFromVersionId=current_version
+              )
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-master-key-rotation'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  MasterKeyRotationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MasterKeyRotationLambda
+      Action: lambda:InvokeFunction
+      Principal: secretsmanager.amazonaws.com
+      SourceArn: !Ref MasterKeySecret
+
+  MasterKeyRotationSchedule:
+    Type: AWS::SecretsManager::RotationSchedule
+    DependsOn: MasterKeyRotationPermission
+    Properties:
+      SecretId: !Ref MasterKeySecret
+      RotationLambdaARN: !GetAtt MasterKeyRotationLambda.Arn
+      RotationRules:
+        AutomaticallyAfterDays: !Ref SecretRotationDays
+
+  #############################################################################
+  # ECS Task Execution Role (pulls images, writes logs, reads secrets)
+  #############################################################################
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-litellm-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref MasterKeySecret
+                  - !Ref ApiKeysSecret
+                  - !Ref DatabaseSecret
+              - Sid: KMSDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt LiteLLMEncryptionKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-ecs-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #############################################################################
+  # ECS Task Role (application runtime permissions)
+  #############################################################################
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-litellm-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BedrockInvoke
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - 'arn:aws:bedrock:*::foundation-model/anthropic.*'
+                  - 'arn:aws:bedrock:*::foundation-model/amazon.*'
+                  - 'arn:aws:bedrock:*::foundation-model/meta.*'
+                  - 'arn:aws:bedrock:*::foundation-model/cohere.*'
+              - Sid: BedrockMarketplaceAccess
+                Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Subscribe
+                Resource: '*'
+        - PolicyName: SecretsRefresh
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsManagerRefresh
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref MasterKeySecret
+                  - !Ref ApiKeysSecret
+                  - !Ref DatabaseSecret
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-ecs-task-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #############################################################################
+  # CloudWatch Log Group for Rotation Lambda
+  #############################################################################
+  RotationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Environment}-litellm-master-key-rotation'
+      RetentionInDays: !If [IsProd, 90, 14]
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-rotation-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+#############################################################################
+# Outputs - Used by other stacks
+#############################################################################
+Outputs:
+  KMSKeyArn:
+    Description: ARN of the KMS encryption key
+    Value: !GetAtt LiteLLMEncryptionKey.Arn
+    Export:
+      Name: !Sub '${Environment}-litellm-kms-key-arn'
+
+  KMSKeyId:
+    Description: ID of the KMS encryption key
+    Value: !Ref LiteLLMEncryptionKey
+    Export:
+      Name: !Sub '${Environment}-litellm-kms-key-id'
+
+  MasterKeySecretArn:
+    Description: ARN of the Master Key secret
+    Value: !Ref MasterKeySecret
+    Export:
+      Name: !Sub '${Environment}-litellm-master-key-arn'
+
+  ApiKeysSecretArn:
+    Description: ARN of the API Keys secret
+    Value: !Ref ApiKeysSecret
+    Export:
+      Name: !Sub '${Environment}-litellm-api-keys-arn'
+
+  DatabaseSecretArn:
+    Description: ARN of the Database credentials secret
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub '${Environment}-litellm-database-secret-arn'
+
+  ECSTaskExecutionRoleArn:
+    Description: ARN of the ECS Task Execution Role
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${Environment}-litellm-ecs-execution-role-arn'
+
+  ECSTaskRoleArn:
+    Description: ARN of the ECS Task Role
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${Environment}-litellm-ecs-task-role-arn'
+
+  MasterKeyRotationLambdaArn:
+    Description: ARN of the Master Key Rotation Lambda
+    Value: !GetAtt MasterKeyRotationLambda.Arn
+    Export:
+      Name: !Sub '${Environment}-litellm-master-key-rotation-lambda-arn'
+
+  GetMasterKeyCommand:
+    Description: Command to retrieve the current master key
+    Value: !Sub |
+      aws secretsmanager get-secret-value --secret-id ${Environment}/litellm/master-key --query 'SecretString' --output text | jq -r '.LITELLM_MASTER_KEY'
+
+  GetDatabasePasswordCommand:
+    Description: Command to retrieve the database password
+    Value: !Sub |
+      aws secretsmanager get-secret-value --secret-id ${Environment}/litellm/database --query 'SecretString' --output text | jq -r '.password'

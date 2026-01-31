@@ -1,0 +1,217 @@
+# Azure Pipeline: Deploy Network Stack
+# Deploys VPC, Subnets, NAT Gateway, Internet Gateway, Security Groups
+# Trigger: Manual only (platform team responsibility)
+#
+# ⚠️ PREREQUISITES BEFORE RUNNING THIS PIPELINE:
+#
+# 1. AWS Service Connection:
+#    - Name: 'aws-litellm-connection'
+#    - Type: AWS
+#    - Authentication: Access Key
+#    - Setup: See docs/SETUP-AZURE-DEVOPS-DETAILED.md
+#
+# 2. Variable Group: 'litellm-aws-config'
+#    Required variables:
+#    - AWS_ACCOUNT_ID: Your AWS account ID
+#    - AWS_REGION: AWS region (default: us-east-1)
+#
+# 3. Security Stack:
+#    - Deploy 'security-stack' FIRST (azure-pipelines-security.yml)
+#    - This stack depends on IAM roles created by security stack
+#
+
+trigger: none
+
+parameters:
+- name: environment
+  displayName: 'Environment to deploy to'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: enableNatGateway
+  displayName: 'Enable NAT Gateway (~$32/month)'
+  type: string
+  default: 'true'
+  values:
+  - 'true'
+  - 'false'
+
+- name: enableMultiAz
+  displayName: 'Enable Multi-AZ deployment'
+  type: string
+  default: 'false'
+  values:
+  - 'true'
+  - 'false'
+
+- name: vpcCidr
+  displayName: 'VPC CIDR block'
+  type: string
+  default: '10.0.0.0/16'
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+
+- name: costCenter
+  displayName: 'Cost Center'
+  type: string
+  default: 'engineering'
+
+- name: owner
+  displayName: 'Owner (team or email)'
+  type: string
+  default: 'DevTeam'
+
+- name: project
+  displayName: 'Project Name'
+  type: string
+  default: 'litellm-proxy'
+
+- name: compliance
+  displayName: 'Compliance Classification'
+  type: string
+  default: 'None'
+  values:
+  - None
+  - HIPAA
+  - PCI
+  - SOC2
+  - GDPR
+
+variables:
+- group: litellm-aws-config
+- name: stackName
+  value: '${{ parameters.environment }}-network-stack'
+- name: templateFile
+  value: 'infrastructure/network-stack.yaml'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: VerifyPrerequisites
+  displayName: 'Verify Prerequisites'
+  jobs:
+  - job: CheckSecurityStack
+    displayName: 'Check Security Stack Exists'
+    steps:
+    - checkout: none
+
+    - template: templates/check-prerequisites.yml
+      parameters:
+        requiredStacks:
+          - '${{ parameters.environment }}-security-stack'
+        awsRegion: '${{ parameters.awsRegion }}'
+        awsServiceConnection: 'aws-litellm-connection'
+
+- stage: DeployNetworkStack
+  displayName: 'Deploy Network Stack'
+  dependsOn: VerifyPrerequisites
+  condition: succeeded()
+  jobs:
+  - job: Deploy
+    displayName: 'Deploy Network Infrastructure'
+    steps:
+    - checkout: self
+      displayName: 'Checkout repository'
+
+    - template: templates/aws-cfn-deploy.yml
+      parameters:
+        stackName: '$(stackName)'
+        templateFile: '$(templateFile)'
+        parameters: 'Environment=${{ parameters.environment }} EnableNatGateway=${{ parameters.enableNatGateway }} EnableMultiAz=${{ parameters.enableMultiAz }} VpcCidr=${{ parameters.vpcCidr }}'
+        capabilities: 'CAPABILITY_IAM'
+        awsRegion: '${{ parameters.awsRegion }}'
+        awsServiceConnection: 'aws-litellm-connection'
+        tags: 'Environment=${{ parameters.environment }} Application=litellm ManagedBy=CloudFormation Owner=PlatformTeam'
+
+    - task: AWSShellScript@1
+      displayName: 'Get Stack Outputs and Display Summary'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "Network Stack Deployed Successfully"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ parameters.environment }}"
+          echo "NAT Gateway: ${{ parameters.enableNatGateway }}"
+          echo "Multi-AZ: ${{ parameters.enableMultiAz }}"
+          echo "VPC CIDR: ${{ parameters.vpcCidr }}"
+          echo ""
+
+          STACK_NAME="$(stackName)"
+
+          # Get VPC ID
+          VPC_ID=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='VPCId'].OutputValue" \
+            --output text)
+          echo "VPC ID: $VPC_ID"
+
+          # Get Public Subnets
+          PUBLIC_SUBNETS=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='PublicSubnets'].OutputValue" \
+            --output text)
+          echo "Public Subnets: $PUBLIC_SUBNETS"
+
+          # Get Private Subnets
+          PRIVATE_SUBNETS=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='PrivateSubnets'].OutputValue" \
+            --output text)
+          echo "Private Subnets: $PRIVATE_SUBNETS"
+
+          # Get ALB Security Group
+          ALB_SG=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='ALBSecurityGroup'].OutputValue" \
+            --output text)
+          echo "ALB Security Group: $ALB_SG"
+
+          # Get ECS Security Group
+          ECS_SG=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='ECSSecurityGroup'].OutputValue" \
+            --output text)
+          echo "ECS Security Group: $ECS_SG"
+
+          # Get RDS Security Group
+          RDS_SG=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='RDSSecurityGroup'].OutputValue" \
+            --output text)
+          echo "RDS Security Group: $RDS_SG"
+
+          echo ""
+          echo "=========================================="
+          echo "Cost Estimation:"
+          echo "=========================================="
+          if [ "${{ parameters.enableNatGateway }}" = "true" ]; then
+            echo "NAT Gateway: ~\$32/month + data transfer costs"
+          else
+            echo "NAT Gateway: Disabled (ECS tasks won't have internet access)"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Next Steps:"
+          echo "=========================================="
+          echo "1. Deploy ALB Stack:"
+          echo "   az pipelines run --name azure-pipelines-alb --parameters environment=${{ parameters.environment }}"
+          echo ""
+          echo "2. Deploy Database Stack:"
+          echo "   az pipelines run --name azure-pipelines-database --parameters environment=${{ parameters.environment }}"
+          echo ""
+          echo "=========================================="
+        failOnStderr: false

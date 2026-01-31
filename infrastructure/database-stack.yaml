@@ -1,0 +1,652 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  LiteLLM Database Stack - RDS PostgreSQL, DB Subnet Group, Secret Rotation
+  Owner: Platform Team
+  Deploy Order: 4 (after alb-stack)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.r6g.large
+      - db.r6g.xlarge
+    Description: RDS instance type
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: Initial storage allocation in GB
+
+  DBMaxAllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 1000
+    Description: Maximum storage with auto-scaling enabled
+
+  EnableMultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable Multi-AZ deployment for high availability
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 35
+    Description: Number of days to retain automated backups
+
+  EnableDeletionProtection:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable deletion protection
+
+  EnableSecretRotation:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable automatic password rotation
+
+  RotationDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Days between password rotations
+
+
+  CostCenter:
+    Type: String
+    Default: engineering
+    Description: Cost center for billing allocation and chargeback
+
+  Owner:
+    Type: String
+    Default: DevTeam
+    Description: Team or person responsible for this resource
+
+  Project:
+    Type: String
+    Default: litellm-proxy
+    Description: Project identifier for cost tracking and resource organization
+
+  Compliance:
+    Type: String
+    Default: None
+    AllowedValues:
+      - None
+      - HIPAA
+      - PCI
+      - SOC2
+      - GDPR
+    Description: Compliance classification for this environment
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+  UseMultiAZ: !Or
+    - !Equals [!Ref EnableMultiAZ, 'true']
+    - !Condition IsProd
+  EnableRotation: !Equals [!Ref EnableSecretRotation, 'true']
+  UseDeletionProtection: !Or
+    - !Equals [!Ref EnableDeletionProtection, 'true']
+    - !Condition IsProd
+
+Resources:
+  #############################################################################
+  # DB Subnet Group
+  #############################################################################
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${Environment}-litellm-db-subnet-group'
+      DBSubnetGroupDescription: Subnet group for LiteLLM RDS instance
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${Environment}-litellm-private-subnet-1-id'
+        - !ImportValue
+          Fn::Sub: '${Environment}-litellm-private-subnet-2-id'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+############################################################################
+  # RDS PostgreSQL Instance
+  #############################################################################
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: !If [IsProd, Snapshot, Delete]
+    UpdateReplacePolicy: !If [IsProd, Snapshot, Delete]
+    Properties:
+      DBInstanceIdentifier: !Sub '${Environment}-litellm-db'
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: '15.10'
+      DBName: litellm
+      MasterUsername: !Sub '{{resolve:secretsmanager:${Environment}/litellm/database:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${Environment}/litellm/database:SecretString:password}}'
+      AllocatedStorage: !Ref DBAllocatedStorage
+      MaxAllocatedStorage: !Ref DBMaxAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !ImportValue
+        Fn::Sub: '${Environment}-litellm-kms-key-arn'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue
+          Fn::Sub: '${Environment}-litellm-rds-sg-id'
+      MultiAZ: !If [UseMultiAZ, true, false]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      DeletionProtection: !If [UseDeletionProtection, true, false]
+      EnablePerformanceInsights: !If [IsProd, true, false]
+      PerformanceInsightsRetentionPeriod: !If [IsProd, 7, !Ref 'AWS::NoValue']
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      EnableIAMDatabaseAuthentication: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-db'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #############################################################################
+  # Update Database Secret with Endpoint
+  #############################################################################
+  UpdateDatabaseSecretLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-litellm-update-db-secret-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: UpdateSecretPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsManagerUpdate
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:UpdateSecret
+                Resource: !ImportValue
+                  Fn::Sub: '${Environment}-litellm-database-secret-arn'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Environment}-litellm-update-db-secret:*'
+              - Sid: KMSDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !ImportValue
+                  Fn::Sub: '${Environment}-litellm-kms-key-arn'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-update-db-secret-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  UpdateDatabaseSecretLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-litellm-update-db-secret'
+      Description: Updates database secret with RDS endpoint after creation
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt UpdateDatabaseSecretLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          SECRET_ARN: !ImportValue
+            Fn::Sub: '${Environment}-litellm-database-secret-arn'
+          DB_ENDPOINT: !GetAtt DBInstance.Endpoint.Address
+          DB_PORT: !GetAtt DBInstance.Endpoint.Port
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              """Update database secret with RDS endpoint."""
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  secrets_client = boto3.client('secretsmanager')
+                  secret_arn = os.environ['SECRET_ARN']
+                  db_endpoint = os.environ['DB_ENDPOINT']
+                  db_port = os.environ['DB_PORT']
+
+                  # Get current secret
+                  response = secrets_client.get_secret_value(SecretId=secret_arn)
+                  secret = json.loads(response['SecretString'])
+
+                  # Update with endpoint info
+                  secret['host'] = db_endpoint
+                  secret['port'] = int(db_port)
+                  secret['engine'] = 'postgres'
+
+                  # Construct DATABASE_URL for LiteLLM
+                  from urllib.parse import quote_plus
+                  password_encoded = quote_plus(secret['password'])
+                  secret['DATABASE_URL'] = f"postgresql://{secret['username']}:{password_encoded}@{db_endpoint}:{db_port}/{secret['dbname']}"
+
+                  # Put updated secret
+                  secrets_client.put_secret_value(
+                      SecretId=secret_arn,
+                      SecretString=json.dumps(secret)
+                  )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Endpoint': db_endpoint,
+                      'Port': db_port
+                  })
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-update-db-secret'
+        - Key: Environment
+          Value: !Ref Environment
+
+  UpdateDatabaseSecretTrigger:
+    Type: Custom::UpdateDatabaseSecret
+    DependsOn: DBInstance
+    Properties:
+      ServiceToken: !GetAtt UpdateDatabaseSecretLambda.Arn
+
+  #############################################################################
+  # Database Password Rotation
+  #############################################################################
+  DBRotationLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: EnableRotation
+    Properties:
+      RoleName: !Sub '${Environment}-litellm-db-rotation-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DBRotationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsManagerRotation
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:UpdateSecretVersionStage
+                  - secretsmanager:DescribeSecret
+                Resource: !ImportValue
+                  Fn::Sub: '${Environment}-litellm-database-secret-arn'
+              - Sid: GeneratePassword
+                Effect: Allow
+                Action: secretsmanager:GetRandomPassword
+                Resource: '*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Environment}-litellm-db-rotation:*'
+              - Sid: KMSDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !ImportValue
+                  Fn::Sub: '${Environment}-litellm-kms-key-arn'
+              - Sid: VPCNetworking
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DetachNetworkInterface
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-db-rotation-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DBRotationLambda:
+    Type: AWS::Lambda::Function
+    Condition: EnableRotation
+    Properties:
+      FunctionName: !Sub '${Environment}-litellm-db-rotation'
+      Description: Rotates RDS PostgreSQL password
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt DBRotationLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: '${Environment}-litellm-lambda-rotation-sg-id'
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: '${Environment}-litellm-private-subnet-1-id'
+          - !ImportValue
+            Fn::Sub: '${Environment}-litellm-private-subnet-2-id'
+      Environment:
+        Variables:
+          SECRETS_MANAGER_ENDPOINT: !Sub 'https://secretsmanager.${AWS::Region}.amazonaws.com'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import psycopg2
+          import os
+
+          def lambda_handler(event, context):
+              """Rotates RDS PostgreSQL password."""
+              arn = event['SecretId']
+              token = event['ClientRequestToken']
+              step = event['Step']
+
+              secrets_client = boto3.client(
+                  'secretsmanager',
+                  endpoint_url=os.environ.get('SECRETS_MANAGER_ENDPOINT')
+              )
+
+              if step == 'createSecret':
+                  create_secret(secrets_client, arn, token)
+              elif step == 'setSecret':
+                  set_secret(secrets_client, arn, token)
+              elif step == 'testSecret':
+                  test_secret(secrets_client, arn, token)
+              elif step == 'finishSecret':
+                  finish_secret(secrets_client, arn, token)
+              else:
+                  raise ValueError(f"Invalid step: {step}")
+
+              return {"statusCode": 200}
+
+          def create_secret(client, arn, token):
+              """Generate new password."""
+              current = client.get_secret_value(SecretId=arn, VersionStage='AWSCURRENT')
+              current_secret = json.loads(current['SecretString'])
+
+              # Generate new password
+              passwd = client.get_random_password(
+                  PasswordLength=32,
+                  ExcludeCharacters='"@/\\'
+              )
+
+              new_secret = current_secret.copy()
+              new_secret['password'] = passwd['RandomPassword']
+
+              try:
+                  client.put_secret_value(
+                      SecretId=arn,
+                      ClientRequestToken=token,
+                      SecretString=json.dumps(new_secret),
+                      VersionStages=['AWSPENDING']
+                  )
+              except client.exceptions.ResourceExistsException:
+                  pass
+
+          def set_secret(client, arn, token):
+              """Set the password in the database."""
+              pending = client.get_secret_value(
+                  SecretId=arn,
+                  VersionId=token,
+                  VersionStage='AWSPENDING'
+              )
+              pending_secret = json.loads(pending['SecretString'])
+
+              current = client.get_secret_value(SecretId=arn, VersionStage='AWSCURRENT')
+              current_secret = json.loads(current['SecretString'])
+
+              # Connect with current password and change to new
+              conn = psycopg2.connect(
+                  host=current_secret['host'],
+                  port=current_secret['port'],
+                  database=current_secret['dbname'],
+                  user=current_secret['username'],
+                  password=current_secret['password']
+              )
+              conn.autocommit = True
+
+              with conn.cursor() as cursor:
+                  cursor.execute(
+                      f"ALTER USER {current_secret['username']} WITH PASSWORD %s",
+                      (pending_secret['password'],)
+                  )
+
+              conn.close()
+
+          def test_secret(client, arn, token):
+              """Test the new password."""
+              pending = client.get_secret_value(
+                  SecretId=arn,
+                  VersionId=token,
+                  VersionStage='AWSPENDING'
+              )
+              secret = json.loads(pending['SecretString'])
+
+              conn = psycopg2.connect(
+                  host=secret['host'],
+                  port=secret['port'],
+                  database=secret['dbname'],
+                  user=secret['username'],
+                  password=secret['password']
+              )
+              conn.close()
+
+          def finish_secret(client, arn, token):
+              """Finalize the rotation."""
+              metadata = client.describe_secret(SecretId=arn)
+
+              current_version = None
+              for version_id, stages in metadata['VersionIdsToStages'].items():
+                  if 'AWSCURRENT' in stages:
+                      current_version = version_id
+                      break
+
+              client.update_secret_version_stage(
+                  SecretId=arn,
+                  VersionStage='AWSCURRENT',
+                  MoveToVersionId=token,
+                  RemoveFromVersionId=current_version
+              )
+      Layers:
+        # Add psycopg2 layer for PostgreSQL connectivity
+        - !Sub 'arn:aws:lambda:${AWS::Region}:770693421928:layer:Klayers-p311-psycopg2-binary:4'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-db-rotation'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DBRotationPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableRotation
+    Properties:
+      FunctionName: !Ref DBRotationLambda
+      Action: lambda:InvokeFunction
+      Principal: secretsmanager.amazonaws.com
+      SourceArn: !ImportValue
+        Fn::Sub: '${Environment}-litellm-database-secret-arn'
+
+  DBRotationSchedule:
+    Type: AWS::SecretsManager::RotationSchedule
+    Condition: EnableRotation
+    DependsOn:
+      - DBRotationPermission
+      - UpdateDatabaseSecretTrigger
+    Properties:
+      SecretId: !ImportValue
+        Fn::Sub: '${Environment}-litellm-database-secret-arn'
+      RotationLambdaARN: !GetAtt DBRotationLambda.Arn
+      RotationRules:
+        AutomaticallyAfterDays: !Ref RotationDays
+
+  #############################################################################
+  # CloudWatch Alarms
+  #############################################################################
+  DBCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-litellm-db-high-cpu'
+      AlarmDescription: Database CPU utilization is high
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstance
+      TreatMissingData: notBreaching
+
+  DBStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-litellm-db-low-storage'
+      AlarmDescription: Database free storage space is low
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 5368709120  # 5GB in bytes
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstance
+      TreatMissingData: notBreaching
+
+  DBConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-litellm-db-high-connections'
+      AlarmDescription: Database connections are near limit
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstance
+      TreatMissingData: notBreaching
+
+#############################################################################
+# Outputs - Used by other stacks
+#############################################################################
+Outputs:
+  DBInstanceIdentifier:
+    Description: RDS Instance Identifier
+    Value: !Ref DBInstance
+    Export:
+      Name: !Sub '${Environment}-litellm-db-identifier'
+
+  DBEndpoint:
+    Description: RDS Endpoint Address
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${Environment}-litellm-db-endpoint'
+
+  DBPort:
+    Description: RDS Port
+    Value: !GetAtt DBInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${Environment}-litellm-db-port'
+
+  DBName:
+    Description: Database Name
+    Value: litellm
+    Export:
+      Name: !Sub '${Environment}-litellm-db-name'
+
+  DatabaseConnectionString:
+    Description: Database connection string (without password)
+    Value: !Sub 'postgresql://litellm_admin:***@${DBInstance.Endpoint.Address}:${DBInstance.Endpoint.Port}/litellm'
+    Export:
+      Name: !Sub '${Environment}-litellm-db-connection-string'
+
+  GetDatabaseConnectionCommand:
+    Description: Command to get full database connection string
+    Value: !Sub |
+      aws secretsmanager get-secret-value --secret-id ${Environment}/litellm/database --query 'SecretString' --output text | jq -r '"postgresql://\(.username):\(.password)@\(.host):\(.port)/\(.dbname)"'

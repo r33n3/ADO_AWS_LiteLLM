@@ -1,0 +1,177 @@
+# Azure Pipeline: Teardown Network Stack
+# Deletes: VPC, subnets, NAT Gateway, Internet Gateway, route tables, security groups
+
+trigger: none
+
+parameters:
+- name: environment
+  displayName: 'Environment'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+- name: confirmDelete
+  displayName: 'Type DELETE to confirm'
+  type: string
+  default: ''
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: litellm-aws-config
+  - group: litellm-aws-secrets
+
+stages:
+- stage: Validate
+  displayName: 'Validate Deletion'
+  jobs:
+  - job: ValidateConfirmation
+    displayName: 'Validate Confirmation'
+    steps:
+    - checkout: none
+
+    - bash: |
+        if [ "${{ parameters.confirmDelete }}" != "DELETE" ]; then
+          echo "❌ Confirmation failed"
+          echo "You must type 'DELETE' to confirm stack deletion"
+          exit 1
+        fi
+        echo "✓ Deletion confirmed"
+      displayName: 'Confirm deletion'
+
+- stage: TeardownNetwork
+  displayName: 'Teardown Network Stack'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: DeleteNetwork
+    displayName: 'Delete Network Stack'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete Network Stack'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          STACK_NAME="${{ parameters.environment }}-network-stack"
+
+          echo "=========================================="
+          echo "Deleting Network Stack"
+          echo "=========================================="
+          echo "Stack Name: $STACK_NAME"
+          echo "Region: ${{ parameters.awsRegion }}"
+          echo "=========================================="
+
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME 2>/dev/null; then
+            echo "Stack exists, proceeding with deletion..."
+
+            # Get stack resources for cleanup verification
+            echo ""
+            echo "Stack resources to be deleted:"
+            aws cloudformation list-stack-resources \
+              --stack-name $STACK_NAME \
+              --query 'StackResourceSummaries[*].[ResourceType,LogicalResourceId]' \
+              --output table
+
+            # Check if NAT Gateway exists (takes longer to delete)
+            NAT_GW=$(aws cloudformation list-stack-resources \
+              --stack-name $STACK_NAME \
+              --query "StackResourceSummaries[?ResourceType=='AWS::EC2::NatGateway'].PhysicalResourceId" \
+              --output text)
+
+            if [ -n "$NAT_GW" ]; then
+              echo ""
+              echo "⚠️  Note: NAT Gateway detected"
+              echo "Deletion will take 2-3 minutes due to NAT Gateway cleanup"
+            fi
+
+            # Delete the stack
+            echo ""
+            echo "Initiating stack deletion..."
+            aws cloudformation delete-stack --stack-name $STACK_NAME
+
+            # Wait for deletion to complete
+            echo "Waiting for stack deletion to complete..."
+            if [ -n "$NAT_GW" ]; then
+              echo "(This typically takes 3-5 minutes due to NAT Gateway)"
+            else
+              echo "(This typically takes 1-2 minutes)"
+            fi
+
+            aws cloudformation wait stack-delete-complete \
+              --stack-name $STACK_NAME \
+              --region ${{ parameters.awsRegion }}
+
+            echo ""
+            echo "=========================================="
+            echo "✓ $STACK_NAME deleted successfully"
+            echo "=========================================="
+
+            # Verify deletion
+            echo ""
+            echo "Verifying cleanup..."
+
+            # Check for orphaned VPCs
+            VPCS=$(aws ec2 describe-vpcs \
+              --filters "Name=tag:Environment,Values=${{ parameters.environment }}" \
+              --query 'Vpcs[*].VpcId' \
+              --output text)
+
+            if [ -n "$VPCS" ]; then
+              echo "⚠️  Warning: Found orphaned VPCs: $VPCS"
+              echo "These should be manually cleaned up if not in use"
+            else
+              echo "✓ No orphaned VPCs found"
+            fi
+
+            # Check for orphaned elastic IPs
+            EIPS=$(aws ec2 describe-addresses \
+              --filters "Name=tag:Environment,Values=${{ parameters.environment }}" \
+              --query 'Addresses[*].AllocationId' \
+              --output text)
+
+            if [ -n "$EIPS" ]; then
+              echo "⚠️  Warning: Found orphaned Elastic IPs: $EIPS"
+              echo "These should be released to avoid charges"
+            else
+              echo "✓ No orphaned Elastic IPs found"
+            fi
+
+          else
+            echo "Stack $STACK_NAME does not exist"
+            echo "Nothing to delete"
+          fi
+        failOnStderr: false
+        timeoutInMinutes: 15
+
+    - bash: |
+        echo ""
+        echo "=========================================="
+        echo "Network Stack Teardown Complete"
+        echo "=========================================="
+        echo ""
+        echo "Deleted resources:"
+        echo "  - VPC and subnets"
+        echo "  - NAT Gateway (if enabled)"
+        echo "  - Internet Gateway"
+        echo "  - Route tables"
+        echo "  - Security groups"
+        echo "  - Network ACLs"
+        echo ""
+        echo "Next steps:"
+        echo "  - ALB, Database, and LiteLLM stacks (if deployed) should be deleted first"
+        echo "  - Security stack can be torn down after this"
+        echo ""
+      displayName: 'Teardown summary'

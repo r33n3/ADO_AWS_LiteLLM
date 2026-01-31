@@ -1,0 +1,735 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  LiteLLM Network Stack - VPC, Subnets, Gateways, Security Groups
+  Owner: Platform Team
+  Deploy Order: 2 (after security-stack)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: CIDR block for VPC
+
+  EnableNatGateway:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable NAT Gateway for private subnets (adds ~$32/month)
+
+  EnableMultiAz:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Deploy resources across multiple availability zones
+
+  CostCenter:
+    Type: String
+    Default: engineering
+    Description: Cost center for billing allocation and chargeback
+
+  Owner:
+    Type: String
+    Default: DevTeam
+    Description: Team or person responsible for this resource
+
+  Project:
+    Type: String
+    Default: litellm-proxy
+    Description: Project identifier for cost tracking and resource organization
+
+  Compliance:
+    Type: String
+    Default: None
+    AllowedValues:
+      - None
+      - HIPAA
+      - PCI
+      - SOC2
+      - GDPR
+    Description: Compliance classification for this environment
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+  CreateNatGateway: !Equals [!Ref EnableNatGateway, 'true']
+  UseMultiAz: !Or
+    - !Equals [!Ref EnableMultiAz, 'true']
+    - !Condition IsProd
+
+Resources:
+  #############################################################################
+  # VPC
+  #############################################################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #############################################################################
+  # Internet Gateway
+  #############################################################################
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  #############################################################################
+  # Public Subnets (for ALB and NAT Gateway)
+  #############################################################################
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 16, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Type
+          Value: Public
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 16, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Type
+          Value: Public
+
+  #############################################################################
+  # Private Subnets (for ECS and RDS)
+  #############################################################################
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [10, !Cidr [!Ref VpcCidr, 16, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Type
+          Value: Private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [11, !Cidr [!Ref VpcCidr, 16, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Type
+          Value: Private
+
+  #############################################################################
+  # NAT Gateway (optional - saves ~$32/month if disabled)
+  #############################################################################
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Condition: CreateNatGateway
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-nat-eip'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-nat'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #############################################################################
+  # Route Tables - Public
+  #############################################################################
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  #############################################################################
+  # Route Tables - Private
+  #############################################################################
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-private-rt'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateRouteWithNat:
+    Type: AWS::EC2::Route
+    Condition: CreateNatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  #############################################################################
+  # VPC Endpoints (reduce NAT Gateway costs for AWS services)
+  #############################################################################
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !If [UseMultiAz, !Ref PrivateSubnet2, !Ref 'AWS::NoValue']
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  ECRApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !If [UseMultiAz, !Ref PrivateSubnet2, !Ref 'AWS::NoValue']
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  ECRDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !If [UseMultiAz, !Ref PrivateSubnet2, !Ref 'AWS::NoValue']
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !If [UseMultiAz, !Ref PrivateSubnet2, !Ref 'AWS::NoValue']
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  #############################################################################
+  # Security Groups
+  #############################################################################
+
+  # VPC Endpoints Security Group
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Environment}-litellm-vpc-endpoints-sg'
+      GroupDescription: Security group for VPC endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-vpc-endpoints-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ALB Security Group
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Environment}-litellm-alb-sg'
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: HTTPS from internet
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: HTTP from internet (redirect to HTTPS)
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-alb-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ECS Security Group
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Environment}-litellm-ecs-sg'
+      GroupDescription: Security group for ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4000
+          ToPort: 4000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: LiteLLM port from ALB only
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: HTTPS for external APIs
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref RDSSecurityGroup
+          Description: PostgreSQL to RDS
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-ecs-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # RDS Security Group
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Environment}-litellm-rds-sg'
+      GroupDescription: Security group for RDS PostgreSQL
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-rds-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # RDS ingress from ECS (separate resource to avoid circular dependency)
+  RDSIngressFromECS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ECSSecurityGroup
+      Description: PostgreSQL from ECS tasks
+
+  # Lambda Rotation Security Group (for RDS password rotation)
+  LambdaRotationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Environment}-litellm-lambda-rotation-sg'
+      GroupDescription: Security group for Lambda rotation functions
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref RDSSecurityGroup
+          Description: PostgreSQL to RDS
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: HTTPS for Secrets Manager API
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-lambda-rotation-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # RDS ingress from Lambda Rotation
+  RDSIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref LambdaRotationSecurityGroup
+      Description: PostgreSQL from Lambda rotation
+
+  # ALB egress to ECS
+  ALBEgressToECS:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 4000
+      ToPort: 4000
+      DestinationSecurityGroupId: !Ref ECSSecurityGroup
+      Description: LiteLLM port to ECS
+
+#############################################################################
+# Outputs - Used by other stacks
+#############################################################################
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${Environment}-litellm-vpc-id'
+
+  VpcCidr:
+    Description: VPC CIDR block
+    Value: !Ref VpcCidr
+    Export:
+      Name: !Sub '${Environment}-litellm-vpc-cidr'
+
+  PublicSubnet1Id:
+    Description: Public Subnet 1 ID
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${Environment}-litellm-public-subnet-1-id'
+
+  PublicSubnet2Id:
+    Description: Public Subnet 2 ID
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${Environment}-litellm-public-subnet-2-id'
+
+  PublicSubnetIds:
+    Description: Comma-separated list of public subnet IDs
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub '${Environment}-litellm-public-subnet-ids'
+
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${Environment}-litellm-private-subnet-1-id'
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${Environment}-litellm-private-subnet-2-id'
+
+  PrivateSubnetIds:
+    Description: Comma-separated list of private subnet IDs
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${Environment}-litellm-private-subnet-ids'
+
+  ALBSecurityGroupId:
+    Description: ALB Security Group ID
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${Environment}-litellm-alb-sg-id'
+
+  ECSSecurityGroupId:
+    Description: ECS Security Group ID
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub '${Environment}-litellm-ecs-sg-id'
+
+  RDSSecurityGroupId:
+    Description: RDS Security Group ID
+    Value: !Ref RDSSecurityGroup
+    Export:
+      Name: !Sub '${Environment}-litellm-rds-sg-id'
+
+  LambdaRotationSecurityGroupId:
+    Description: Lambda Rotation Security Group ID
+    Value: !Ref LambdaRotationSecurityGroup
+    Export:
+      Name: !Sub '${Environment}-litellm-lambda-rotation-sg-id'
+
+  NatGatewayEnabled:
+    Description: Whether NAT Gateway is enabled
+    Value: !If [CreateNatGateway, 'true', 'false']
+    Export:
+      Name: !Sub '${Environment}-litellm-nat-enabled'

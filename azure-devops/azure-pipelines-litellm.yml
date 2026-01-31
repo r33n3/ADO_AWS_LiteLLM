@@ -1,0 +1,485 @@
+# Azure Pipeline: Deploy LiteLLM Stack
+# Builds Docker image, pushes to ECR, deploys ECS service
+# Trigger: Manual only (no auto-trigger on push)
+#
+# ⚠️ PREREQUISITES BEFORE RUNNING THIS PIPELINE:
+#
+# 1. AWS Service Connection:
+#    - Name: 'aws-litellm-connection'
+#    - Type: AWS
+#    - Authentication: Access Key
+#    - Setup: See docs/SETUP-AZURE-DEVOPS-DETAILED.md
+#    - Required AWS CLI access to ECR, ECS, CloudFormation
+#
+# 2. Variable Group: 'litellm-aws-config'
+#    Required variables:
+#    - AWS_ACCOUNT_ID: Your AWS account ID (e.g., 123456789012)
+#    - AWS_REGION: AWS region (e.g., us-east-1)
+#
+# 3. Variable Group: 'litellm-aws-secrets' ⚠️ MUST BE MARKED AS SECRET
+#    Required API keys (at least ONE is required):
+#    - OPENAI_API_KEY: OpenAI API key (starts with sk-)
+#    - ANTHROPIC_API_KEY: Anthropic API key (starts with sk-ant-)
+#    - AWS_BEDROCK_REGION: AWS Bedrock region (if using Bedrock)
+#
+#    ⚠️ HOW TO GET API KEYS:
+#    - OpenAI: https://platform.openai.com/api-keys
+#    - Anthropic: https://console.anthropic.com/settings/keys
+#    - AWS Bedrock: Configure via AWS Console (no separate key needed)
+#
+# 4. All other stacks must be deployed first:
+#    - Security Stack (azure-pipelines-security.yml)
+#    - Network Stack (azure-pipelines-network.yml)
+#    - ALB Stack (azure-pipelines-alb.yml)
+#    - Database Stack (azure-pipelines-database.yml)
+#
+# 5. ECR Repository:
+#    - Repository 'litellm-proxy' will be created automatically if not exists
+#
+
+trigger: none
+
+pr: none
+
+parameters:
+- name: environment
+  displayName: 'Environment to deploy to'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: containerCpu
+  displayName: 'CPU units (256=0.25 vCPU)'
+  type: string
+  default: '512'
+  values:
+  - '256'
+  - '512'
+  - '1024'
+  - '2048'
+
+- name: containerMemory
+  displayName: 'Memory (MB)'
+  type: string
+  default: '1024'
+  values:
+  - '512'
+  - '1024'
+  - '2048'
+  - '4096'
+
+- name: desiredCount
+  displayName: 'Desired task count'
+  type: number
+  default: 1
+
+- name: enableAutoscaling
+  displayName: 'Enable auto-scaling'
+  type: string
+  default: 'true'
+  values:
+  - 'true'
+  - 'false'
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+
+- name: costCenter
+  displayName: 'Cost Center'
+  type: string
+  default: 'engineering'
+
+- name: owner
+  displayName: 'Owner (team or email)'
+  type: string
+  default: 'DevTeam'
+
+- name: project
+  displayName: 'Project Name'
+  type: string
+  default: 'litellm-proxy'
+
+- name: compliance
+  displayName: 'Compliance Classification'
+  type: string
+  default: 'None'
+  values:
+  - None
+  - HIPAA
+  - PCI
+  - SOC2
+  - GDPR
+
+variables:
+- group: litellm-aws-config
+- group: litellm-aws-secrets
+- name: stackName
+  value: '${{ parameters.environment }}-litellm-stack'
+- name: templateFile
+  value: 'infrastructure/litellm-stack.yaml'
+- name: ecrRepository
+  value: 'litellm-proxy'
+- name: imageTag
+  value: '$(Build.SourceVersion)'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: VerifyPrerequisites
+  displayName: 'Verify Prerequisites'
+  jobs:
+  - job: CheckStacks
+    displayName: 'Check All Required Stacks Exist'
+    steps:
+    - checkout: none
+
+    - template: templates/check-prerequisites.yml
+      parameters:
+        requiredStacks:
+          - '${{ parameters.environment }}-security-stack'
+          - '${{ parameters.environment }}-network-stack'
+          - '${{ parameters.environment }}-alb-stack'
+          - '${{ parameters.environment }}-database-stack'
+        awsRegion: '${{ parameters.awsRegion }}'
+        awsServiceConnection: 'aws-litellm-connection'
+
+- stage: BuildAndPushImage
+  displayName: 'Build and Push Docker Image'
+  dependsOn: VerifyPrerequisites
+  condition: succeeded()
+  jobs:
+  - job: BuildDocker
+    displayName: 'Build Docker Image and Push to ECR'
+    steps:
+    - checkout: self
+      displayName: 'Checkout repository'
+
+    - template: templates/aws-ecr-build.yml
+      parameters:
+        repository: '$(ecrRepository)'
+        imageTag: '$(imageTag)'
+        dockerfilePath: './Dockerfile'
+        dockerContext: '.'
+        awsRegion: '${{ parameters.awsRegion }}'
+        awsServiceConnection: 'aws-litellm-connection'
+        additionalTags:
+          - 'latest'
+
+- stage: DeployLiteLLMStack
+  displayName: 'Deploy LiteLLM Stack'
+  dependsOn: BuildAndPushImage
+  condition: succeeded()
+  jobs:
+  - job: Deploy
+    displayName: 'Deploy ECS Service'
+    variables:
+      imageUri: $[ stageDependencies.BuildAndPushImage.BuildDocker.outputs['PushImage.IMAGE_URI'] ]
+    steps:
+    - checkout: self
+      displayName: 'Checkout repository'
+
+    - task: Bash@3
+      displayName: 'Verify template file before deployment'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "==========================================="
+          echo "Pre-Deployment Template Verification"
+          echo "==========================================="
+          echo "Working directory: $(pwd)"
+          echo "Template file path: $(templateFile)"
+          echo ""
+
+          # Check file exists
+          if [ ! -f "$(templateFile)" ]; then
+            echo "❌ FATAL ERROR: Template file not found: $(templateFile)"
+            exit 1
+          fi
+
+          echo "✓ Template file exists"
+          echo ""
+          echo "File details:"
+          ls -lh "$(templateFile)"
+          echo ""
+          echo "MD5 checksum:"
+          md5sum "$(templateFile)"
+          echo ""
+          echo "First 10 lines:"
+          head -10 "$(templateFile)"
+          echo ""
+
+          # Verify it's the correct template (not deprecated ecs-stack.yaml)
+          if grep -q "Complete Infrastructure Stack" "$(templateFile)"; then
+            echo "❌ FATAL ERROR: Wrong template detected!"
+            echo "❌ File contains 'Complete Infrastructure Stack' (deprecated ecs-stack.yaml)"
+            echo "❌ Expected: 'LiteLLM Application Stack' (litellm-stack.yaml)"
+            exit 1
+          fi
+
+          if ! grep -q "LiteLLM Application Stack" "$(templateFile)"; then
+            echo "⚠️  WARNING: Could not verify template description"
+            echo "⚠️  Expected to find 'LiteLLM Application Stack'"
+          else
+            echo "✓ Template verified: LiteLLM Application Stack (modular)"
+          fi
+
+          # Verify it doesn't contain VPC resources (should use imports)
+          if grep -q "Type: AWS::EC2::VPC" "$(templateFile)"; then
+            echo "❌ FATAL ERROR: Template contains VPC resources!"
+            echo "❌ LiteLLM stack should import VPC from network-stack, not create it"
+            echo "❌ This indicates ecs-stack.yaml (monolithic) is being used"
+            exit 1
+          fi
+
+          echo "✓ Template does not contain VPC resources (correct - uses imports)"
+          echo ""
+          echo "==========================================="
+          echo "✓ All pre-deployment checks passed"
+          echo "==========================================="
+
+    - task: AWSShellScript@1
+      displayName: 'Get AWS Account ID and build Image URI'
+      name: GetImageUri
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ parameters.awsRegion }}.amazonaws.com"
+          IMAGE_URI="${ECR_REGISTRY}/$(ecrRepository):$(imageTag)"
+
+          echo "Image URI: $IMAGE_URI"
+          echo "##vso[task.setvariable variable=IMAGE_URI;isOutput=true]$IMAGE_URI"
+
+    - template: templates/aws-cfn-deploy.yml
+      parameters:
+        stackName: '$(stackName)'
+        templateFile: 'infrastructure/litellm-stack.yaml'
+        parameters: 'Environment=${{ parameters.environment }} ContainerImage=$(GetImageUri.IMAGE_URI) ContainerCpu=${{ parameters.containerCpu }} ContainerMemory=${{ parameters.containerMemory }} DesiredCount=${{ parameters.desiredCount }} EnableAutoScaling=${{ parameters.enableAutoscaling }}'
+        capabilities: 'CAPABILITY_IAM'
+        awsRegion: '${{ parameters.awsRegion }}'
+        awsServiceConnection: 'aws-litellm-connection'
+        tags: 'Environment=${{ parameters.environment }} Application=litellm ManagedBy=CloudFormation Owner=DevTeam'
+
+    - task: AWSShellScript@1
+      displayName: 'Force ECS service deployment'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "Forcing new ECS service deployment..."
+
+          STACK_NAME="$(stackName)"
+
+          # Get cluster and service names from CloudFormation outputs
+          CLUSTER_NAME=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ECSClusterName'].OutputValue" \
+            --output text)
+
+          SERVICE_NAME=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ECSServiceName'].OutputValue" \
+            --output text)
+
+          echo "Cluster: $CLUSTER_NAME"
+          echo "Service: $SERVICE_NAME"
+
+          # Validate outputs were retrieved
+          if [ -z "$CLUSTER_NAME" ] || [ -z "$SERVICE_NAME" ]; then
+            echo "❌ ERROR: Failed to retrieve cluster or service name from stack outputs"
+            echo "Stack: $STACK_NAME"
+            echo "Cluster name: '$CLUSTER_NAME'"
+            echo "Service name: '$SERVICE_NAME'"
+            exit 1
+          fi
+
+          # Force new deployment
+          echo "Forcing new ECS deployment..."
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
+            --force-new-deployment \
+            --region ${{ parameters.awsRegion }} >/dev/null
+
+          if [ $? -ne 0 ]; then
+            echo "⚠️  Failed to force new deployment, but stack creation was successful"
+            echo "ℹ️  You can manually restart the service with:"
+            echo "    aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --force-new-deployment --region ${{ parameters.awsRegion }}"
+            exit 0
+          fi
+
+          echo "Waiting for service to stabilize..."
+
+          # Wait for service to be stable
+          aws ecs wait services-stable \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ parameters.awsRegion }}
+
+          if [ $? -eq 0 ]; then
+            echo "✓ Service deployment completed successfully"
+          else
+            echo "⚠️  Service deployment timed out or failed"
+            echo "ℹ️  Check service status with:"
+            echo "    aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --region ${{ parameters.awsRegion }}"
+            exit 1
+          fi
+        failOnStderr: false
+
+    - task: AWSShellScript@1
+      displayName: 'Verify health endpoint'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "Verifying LiteLLM health endpoint..."
+
+          STACK_NAME="$(stackName)"
+
+          # Get ALB URL
+          ALB_STACK="${{ parameters.environment }}-alb-stack"
+          ALB_URL=$(aws cloudformation describe-stacks \
+            --stack-name $ALB_STACK \
+            --region ${{ parameters.awsRegion }} \
+            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerURL'].OutputValue" \
+            --output text)
+
+          echo "ALB URL: $ALB_URL"
+
+          # Validate ALB URL was retrieved
+          if [ -z "$ALB_URL" ]; then
+            echo "❌ ERROR: Failed to retrieve ALB URL from stack $ALB_STACK"
+            exit 1
+          fi
+
+          # Try health check multiple times
+          MAX_RETRIES=10
+          RETRY_DELAY=10
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Health check attempt $i/$MAX_RETRIES..."
+
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${ALB_URL}/health/liveliness || echo "000")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✓ Health check passed (HTTP $HTTP_CODE)"
+              break
+            else
+              echo "⚠️  Health check failed (HTTP $HTTP_CODE)"
+              if [ $i -eq $MAX_RETRIES ]; then
+                echo "❌ Health check failed after $MAX_RETRIES attempts"
+                exit 1
+              fi
+              echo "Retrying in ${RETRY_DELAY}s..."
+              sleep $RETRY_DELAY
+            fi
+          done
+        failOnStderr: false
+
+    - task: AWSShellScript@1
+      displayName: 'Get Stack Outputs and Display Summary'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "LiteLLM Stack Deployed Successfully"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ parameters.environment }}"
+          echo "Container Image: $(GetImageUri.IMAGE_URI)"
+          echo "CPU: ${{ parameters.containerCpu }} | Memory: ${{ parameters.containerMemory }}MB"
+          echo "Desired Count: ${{ parameters.desiredCount }}"
+          echo "Auto-scaling: ${{ parameters.enableAutoscaling }}"
+          echo ""
+
+          STACK_NAME="$(stackName)"
+          ALB_STACK="${{ parameters.environment }}-alb-stack"
+
+          # Get ECS Cluster
+          CLUSTER_NAME=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='ClusterName'].OutputValue" \
+            --output text)
+          echo "ECS Cluster: $CLUSTER_NAME"
+
+          # Get ECS Service
+          SERVICE_NAME=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='ServiceName'].OutputValue" \
+            --output text)
+          echo "ECS Service: $SERVICE_NAME"
+
+          # Get Task Definition
+          TASK_DEF=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='TaskDefinitionArn'].OutputValue" \
+            --output text)
+          echo "Task Definition: $TASK_DEF"
+
+          # Get ALB URL
+          ALB_URL=$(aws cloudformation describe-stacks \
+            --stack-name $ALB_STACK \
+            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerUrl'].OutputValue" \
+            --output text)
+          echo "ALB URL: $ALB_URL"
+
+          # Get running task count
+          RUNNING_TASKS=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --query 'services[0].runningCount' \
+            --output text)
+          echo "Running Tasks: $RUNNING_TASKS"
+
+          echo ""
+          echo "=========================================="
+          echo "API Endpoint:"
+          echo "=========================================="
+          echo "Base URL: $ALB_URL"
+          echo "Health Check: ${ALB_URL}/health/liveliness"
+          echo "API Docs: ${ALB_URL}/docs"
+          echo ""
+
+          echo "=========================================="
+          echo "Test Commands:"
+          echo "=========================================="
+          echo "# Get LiteLLM Master Key from Secrets Manager"
+          echo "MASTER_KEY=\$(aws secretsmanager get-secret-value \\"
+          echo "  --secret-id ${{ parameters.environment }}/litellm/master-key \\"
+          echo "  --query SecretString --output text | jq -r .LITELLM_MASTER_KEY)"
+          echo ""
+          echo "# Test API endpoint"
+          echo "curl -X GET \"${ALB_URL}/health/liveliness\""
+          echo ""
+          echo "# List models"
+          echo "curl -X GET \"${ALB_URL}/v1/models\" \\"
+          echo "  -H \"Authorization: Bearer \$MASTER_KEY\""
+          echo ""
+          echo "# Test chat completion"
+          echo "curl -X POST \"${ALB_URL}/v1/chat/completions\" \\"
+          echo "  -H \"Authorization: Bearer \$MASTER_KEY\" \\"
+          echo "  -H \"Content-Type: application/json\" \\"
+          echo "  -d '{\"model\": \"gpt-3.5-turbo\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello!\"}]}'"
+          echo ""
+          echo "=========================================="
+          echo "Monitor Logs:"
+          echo "=========================================="
+          echo "aws logs tail /ecs/${{ parameters.environment }}-litellm --follow"
+          echo ""
+          echo "=========================================="
+        failOnStderr: false

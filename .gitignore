@@ -1,0 +1,53 @@
+# Environment files (contain secrets)
+.env
+*.env.local
+
+# Azure DevOps configuration (contains credentials)
+azure-devops/setup-config.env
+
+# AWS credentials
+credentials
+.aws/
+
+# Terraform state (if added later)
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker
+.docker/
+
+# Node (if UI added)
+node_modules/
+
+# Python (if scripts added)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Claude Code local settings
+.claude/
+
+# Generated compliance reports
+teardown-compliance-report-*.md
+
+# Temporary files
+/tmp/
+*.tmp
+*.bak

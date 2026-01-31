@@ -1,0 +1,169 @@
+# Azure Pipeline: Teardown ALB Stack
+# Deletes: Application Load Balancer, target groups, listeners, WAF (if enabled)
+
+trigger: none
+
+parameters:
+- name: environment
+  displayName: 'Environment'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+- name: confirmDelete
+  displayName: 'Type DELETE to confirm'
+  type: string
+  default: ''
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: litellm-aws-config
+  - group: litellm-aws-secrets
+
+stages:
+- stage: Validate
+  displayName: 'Validate Deletion'
+  jobs:
+  - job: ValidateConfirmation
+    displayName: 'Validate Confirmation'
+    steps:
+    - checkout: none
+
+    - bash: |
+        if [ "${{ parameters.confirmDelete }}" != "DELETE" ]; then
+          echo "❌ Confirmation failed"
+          echo "You must type 'DELETE' to confirm stack deletion"
+          exit 1
+        fi
+        echo "✓ Deletion confirmed"
+      displayName: 'Confirm deletion'
+
+- stage: TeardownALB
+  displayName: 'Teardown ALB Stack'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: DeleteALB
+    displayName: 'Delete ALB Stack'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete ALB Stack'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          STACK_NAME="${{ parameters.environment }}-alb-stack"
+
+          echo "=========================================="
+          echo "Deleting ALB Stack"
+          echo "=========================================="
+          echo "Stack Name: $STACK_NAME"
+          echo "Region: ${{ parameters.awsRegion }}"
+          echo "=========================================="
+
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME 2>/dev/null; then
+            echo "Stack exists, proceeding with deletion..."
+
+            # Get stack resources for cleanup verification
+            echo ""
+            echo "Stack resources to be deleted:"
+            aws cloudformation list-stack-resources \
+              --stack-name $STACK_NAME \
+              --query 'StackResourceSummaries[*].[ResourceType,LogicalResourceId]' \
+              --output table
+
+            # Check if WAF is enabled
+            WAF_ACL=$(aws cloudformation list-stack-resources \
+              --stack-name $STACK_NAME \
+              --query "StackResourceSummaries[?ResourceType=='AWS::WAFv2::WebACL'].PhysicalResourceId" \
+              --output text 2>/dev/null)
+
+            if [ -n "$WAF_ACL" ]; then
+              echo ""
+              echo "⚠️  Note: WAF Web ACL detected"
+              echo "WAF resources will be deleted with the stack"
+            fi
+
+            # Delete the stack
+            echo ""
+            echo "Initiating stack deletion..."
+            aws cloudformation delete-stack --stack-name $STACK_NAME
+
+            # Wait for deletion to complete
+            echo "Waiting for stack deletion to complete..."
+            echo "(This typically takes 2-3 minutes)"
+            aws cloudformation wait stack-delete-complete \
+              --stack-name $STACK_NAME \
+              --region ${{ parameters.awsRegion }}
+
+            echo ""
+            echo "=========================================="
+            echo "✓ $STACK_NAME deleted successfully"
+            echo "=========================================="
+
+            # Verify deletion
+            echo ""
+            echo "Verifying cleanup..."
+
+            # Check for orphaned load balancers
+            ALBS=$(aws elbv2 describe-load-balancers \
+              --query "LoadBalancers[?contains(LoadBalancerName, '${{ parameters.environment }}-litellm')].LoadBalancerArn" \
+              --output text 2>/dev/null)
+
+            if [ -n "$ALBS" ]; then
+              echo "⚠️  Warning: Found orphaned load balancers"
+              echo "These should be manually cleaned up if not in use"
+            else
+              echo "✓ No orphaned load balancers found"
+            fi
+
+            # Check for orphaned target groups
+            TGS=$(aws elbv2 describe-target-groups \
+              --query "TargetGroups[?contains(TargetGroupName, '${{ parameters.environment }}-litellm')].TargetGroupArn" \
+              --output text 2>/dev/null)
+
+            if [ -n "$TGS" ]; then
+              echo "⚠️  Warning: Found orphaned target groups"
+              echo "These should be manually cleaned up if not in use"
+            else
+              echo "✓ No orphaned target groups found"
+            fi
+
+          else
+            echo "Stack $STACK_NAME does not exist"
+            echo "Nothing to delete"
+          fi
+        failOnStderr: false
+        timeoutInMinutes: 10
+
+    - bash: |
+        echo ""
+        echo "=========================================="
+        echo "ALB Stack Teardown Complete"
+        echo "=========================================="
+        echo ""
+        echo "Deleted resources:"
+        echo "  - Application Load Balancer"
+        echo "  - Target groups"
+        echo "  - Listeners (HTTP/HTTPS)"
+        echo "  - WAF Web ACL (if enabled)"
+        echo "  - CloudWatch alarms"
+        echo ""
+        echo "Next steps:"
+        echo "  - LiteLLM stack (if deployed) should be deleted first"
+        echo "  - Network and Security stacks can be torn down after ALB"
+        echo ""
+      displayName: 'Teardown summary'

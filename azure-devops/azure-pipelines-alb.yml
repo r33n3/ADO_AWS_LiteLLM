@@ -1,0 +1,239 @@
+# Azure Pipeline: Deploy ALB Stack
+# Deploys Application Load Balancer, HTTPS Listener, ACM Certificate, WAF
+# Trigger: Manual only (platform team responsibility)
+#
+# ⚠️ PREREQUISITES BEFORE RUNNING THIS PIPELINE:
+#
+# 1. AWS Service Connection:
+#    - Name: 'aws-litellm-connection'
+#    - Type: AWS
+#    - Authentication: Access Key
+#    - Setup: See docs/SETUP-AZURE-DEVOPS-DETAILED.md
+#
+# 2. Variable Group: 'litellm-aws-config'
+#    Required variables:
+#    - AWS_ACCOUNT_ID: Your AWS account ID
+#    - AWS_REGION: AWS region (default: us-east-1)
+#
+# 3. Security and Network Stacks:
+#    - Deploy 'security-stack' first (azure-pipelines-security.yml)
+#    - Deploy 'network-stack' second (azure-pipelines-network.yml)
+#
+# 4. Domain Configuration (OPTIONAL - for HTTPS):
+#    For HTTP-only deployment (dev environment):
+#    - Leave "domainName" and "hostedZoneId" as default (single space)
+#    - Set "enableWaf" to false
+#
+#    For HTTPS with custom domain (production):
+#    - Replace space in "domainName" with your domain (e.g., api.example.com)
+#    - Replace space in "hostedZoneId" with your Route53 zone ID
+#
+
+trigger: none
+
+parameters:
+- name: environment
+  displayName: 'Environment to deploy to'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: domainName
+  displayName: '[OPTIONAL] Custom domain for HTTPS (keep default space for HTTP-only deployment)'
+  type: string
+  default: ' '
+
+- name: hostedZoneId
+  displayName: '[OPTIONAL] Route53 Hosted Zone ID (only needed if custom domain used above)'
+  type: string
+  default: ' '
+
+- name: enableWaf
+  displayName: 'Enable AWS WAF protection'
+  type: string
+  default: 'false'
+  values:
+  - 'true'
+  - 'false'
+
+- name: wafRateLimit
+  displayName: 'WAF rate limit per IP (requests per 5 min)'
+  type: number
+  default: 2000
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+
+- name: costCenter
+  displayName: 'Cost Center'
+  type: string
+  default: 'engineering'
+
+- name: owner
+  displayName: 'Owner (team or email)'
+  type: string
+  default: 'DevTeam'
+
+- name: project
+  displayName: 'Project Name'
+  type: string
+  default: 'litellm-proxy'
+
+- name: compliance
+  displayName: 'Compliance Classification'
+  type: string
+  default: 'None'
+  values:
+  - None
+  - HIPAA
+  - PCI
+  - SOC2
+  - GDPR
+
+variables:
+- group: litellm-aws-config
+- name: stackName
+  value: '${{ parameters.environment }}-alb-stack'
+- name: templateFile
+  value: 'infrastructure/alb-stack.yaml'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: VerifyPrerequisites
+  displayName: 'Verify Prerequisites'
+  jobs:
+  - job: CheckNetworkStack
+    displayName: 'Check Network Stack Exists'
+    steps:
+    - checkout: none
+
+    - template: templates/check-prerequisites.yml
+      parameters:
+        requiredStacks:
+          - '${{ parameters.environment }}-network-stack'
+        awsRegion: '${{ parameters.awsRegion }}'
+        awsServiceConnection: 'aws-litellm-connection'
+
+- stage: DeployALBStack
+  displayName: 'Deploy ALB Stack'
+  dependsOn: VerifyPrerequisites
+  condition: succeeded()
+  jobs:
+  - job: Deploy
+    displayName: 'Deploy Application Load Balancer'
+    steps:
+    - checkout: self
+      displayName: 'Checkout repository'
+
+    # Deploy with WAF enabled
+    - ${{ if eq(parameters.enableWaf, 'true') }}:
+      - template: templates/aws-cfn-deploy.yml
+        parameters:
+          stackName: '$(stackName)'
+          templateFile: '$(templateFile)'
+          parameters: 'Environment=${{ parameters.environment }} DomainName=${{ parameters.domainName }} HostedZoneId=${{ parameters.hostedZoneId }} EnableWAF=true WAFRateLimitPerIP=${{ parameters.wafRateLimit }}'
+          capabilities: 'CAPABILITY_IAM'
+          awsRegion: '${{ parameters.awsRegion }}'
+          awsServiceConnection: 'aws-litellm-connection'
+          tags: 'Environment=${{ parameters.environment }} Application=litellm ManagedBy=CloudFormation Owner=PlatformTeam'
+
+    # Deploy without WAF (dev environment)
+    - ${{ if eq(parameters.enableWaf, 'false') }}:
+      - template: templates/aws-cfn-deploy.yml
+        parameters:
+          stackName: '$(stackName)'
+          templateFile: '$(templateFile)'
+          parameters: 'Environment=${{ parameters.environment }} DomainName=${{ parameters.domainName }} HostedZoneId=${{ parameters.hostedZoneId }} EnableWAF=false'
+          capabilities: 'CAPABILITY_IAM'
+          awsRegion: '${{ parameters.awsRegion }}'
+          awsServiceConnection: 'aws-litellm-connection'
+          tags: 'Environment=${{ parameters.environment }} Application=litellm ManagedBy=CloudFormation Owner=PlatformTeam'
+
+    - task: AWSShellScript@1
+      displayName: 'Get Stack Outputs and Display Summary'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "ALB Stack Deployed Successfully"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ parameters.environment }}"
+          echo "WAF Enabled: ${{ parameters.enableWaf }}"
+          if [ -n "${{ parameters.domainName }}" ]; then
+            echo "Domain: ${{ parameters.domainName }}"
+          fi
+          echo ""
+
+          STACK_NAME="$(stackName)"
+
+          # Get ALB ARN
+          ALB_ARN=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerArn'].OutputValue" \
+            --output text)
+          echo "ALB ARN: $ALB_ARN"
+
+          # Get ALB DNS Name
+          ALB_DNS=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerDNS'].OutputValue" \
+            --output text)
+          echo "ALB DNS: $ALB_DNS"
+
+          # Get ALB URL
+          ALB_URL=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerUrl'].OutputValue" \
+            --output text)
+          echo "ALB URL: $ALB_URL"
+
+          # Get Target Group ARN
+          TG_ARN=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='TargetGroupArn'].OutputValue" \
+            --output text)
+          echo "Target Group ARN: $TG_ARN"
+
+          # Get HTTPS Listener ARN if domain configured
+          if [ -n "${{ parameters.domainName }}" ]; then
+            HTTPS_LISTENER=$(aws cloudformation describe-stacks \
+              --stack-name $STACK_NAME \
+              --query "Stacks[0].Outputs[?OutputKey=='HTTPSListenerArn'].OutputValue" \
+              --output text)
+            echo "HTTPS Listener ARN: $HTTPS_LISTENER"
+
+            ACM_CERT=$(aws cloudformation describe-stacks \
+              --stack-name $STACK_NAME \
+              --query "Stacks[0].Outputs[?OutputKey=='CertificateArn'].OutputValue" \
+              --output text)
+            echo "ACM Certificate ARN: $ACM_CERT"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Next Steps:"
+          echo "=========================================="
+          echo "1. Deploy Database Stack:"
+          echo "   az pipelines run --name azure-pipelines-database --parameters environment=${{ parameters.environment }}"
+          echo ""
+          echo "2. Deploy LiteLLM Stack:"
+          echo "   az pipelines run --name azure-pipelines-litellm --parameters environment=${{ parameters.environment }}"
+          echo ""
+          if [ -n "${{ parameters.domainName }}" ]; then
+            echo "3. Update DNS to point to ALB:"
+            echo "   ${{ parameters.domainName }} CNAME $ALB_DNS"
+            echo ""
+          fi
+          echo "=========================================="
+        failOnStderr: false

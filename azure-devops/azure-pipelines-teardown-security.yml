@@ -1,0 +1,254 @@
+# Azure Pipeline: Teardown Security Stack
+# Deletes: KMS keys, Secrets Manager secrets, IAM roles, Lambda functions
+
+trigger: none
+
+parameters:
+- name: environment
+  displayName: 'Environment'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+- name: confirmDelete
+  displayName: 'Type DELETE to confirm'
+  type: string
+  default: ''
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: litellm-aws-config
+  - group: litellm-aws-secrets
+
+stages:
+- stage: Validate
+  displayName: 'Validate Deletion'
+  jobs:
+  - job: ValidateConfirmation
+    displayName: 'Validate Confirmation'
+    steps:
+    - checkout: none
+
+    - bash: |
+        if [ "${{ parameters.confirmDelete }}" != "DELETE" ]; then
+          echo "❌ Confirmation failed"
+          echo "You must type 'DELETE' to confirm stack deletion"
+          exit 1
+        fi
+        echo "✓ Deletion confirmed"
+      displayName: 'Confirm deletion'
+
+- stage: TeardownSecurity
+  displayName: 'Teardown Security Stack'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: DeleteSecurity
+    displayName: 'Delete Security Stack'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete Security Stack'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          STACK_NAME="${{ parameters.environment }}-security-stack"
+
+          echo "=========================================="
+          echo "Deleting Security Stack"
+          echo "=========================================="
+          echo "Stack Name: $STACK_NAME"
+          echo "Region: ${{ parameters.awsRegion }}"
+          echo "=========================================="
+
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME 2>/dev/null; then
+            echo "Stack exists, proceeding with deletion..."
+
+            # Get stack resources for cleanup verification
+            echo ""
+            echo "Stack resources to be deleted:"
+            aws cloudformation list-stack-resources \
+              --stack-name $STACK_NAME \
+              --query 'StackResourceSummaries[*].[ResourceType,LogicalResourceId]' \
+              --output table
+
+            # Delete the stack
+            echo ""
+            echo "Initiating stack deletion..."
+            aws cloudformation delete-stack --stack-name $STACK_NAME
+
+            # Wait for deletion to complete
+            echo "Waiting for stack deletion to complete..."
+            echo "(This typically takes 2-3 minutes)"
+            aws cloudformation wait stack-delete-complete \
+              --stack-name $STACK_NAME \
+              --region ${{ parameters.awsRegion }}
+
+            echo ""
+            echo "=========================================="
+            echo "✓ $STACK_NAME deleted successfully"
+            echo "=========================================="
+
+            # Verify deletion
+            echo ""
+            echo "Verifying cleanup..."
+
+            # Check for orphaned secrets
+            SECRETS=$(aws secretsmanager list-secrets \
+              --filters Key=name,Values=${{ parameters.environment }}/litellm \
+              --query 'SecretList[*].Name' \
+              --output text)
+
+            if [ -n "$SECRETS" ]; then
+              echo "Found orphaned secrets, force-deleting..."
+              for secret in $SECRETS; do
+                echo "  Deleting secret: $secret"
+                aws secretsmanager delete-secret \
+                  --secret-id "$secret" \
+                  --force-delete-without-recovery 2>/dev/null && echo "    ✓ Deleted $secret" || echo "    ⚠️  Failed to delete $secret"
+              done
+            else
+              echo "✓ No orphaned secrets found"
+            fi
+
+            # Check for orphaned KMS keys
+            KMS_ALIASES=$(aws kms list-aliases \
+              --query "Aliases[?starts_with(AliasName, 'alias/${{ parameters.environment }}-litellm')].AliasName" \
+              --output text)
+
+            if [ -n "$KMS_ALIASES" ]; then
+              echo "⚠️  Warning: Found orphaned KMS aliases: $KMS_ALIASES"
+              echo "These should be manually cleaned up if not in use"
+            else
+              echo "✓ No orphaned KMS aliases found"
+            fi
+
+          else
+            echo "Stack $STACK_NAME does not exist"
+            echo "Nothing to delete"
+          fi
+        failOnStderr: false
+        timeoutInMinutes: 10
+
+    - task: AWSShellScript@1
+      displayName: 'Cleanup orphaned IAM roles'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo ""
+          echo "=========================================="
+          echo "Cleaning up orphaned IAM roles..."
+          echo "=========================================="
+          echo ""
+
+          cleanup_role() {
+              local role_name=$1
+              echo "Processing role: $role_name"
+
+              # Check if role exists
+              if ! aws iam get-role --role-name $role_name >/dev/null 2>&1; then
+                  echo "  ✓ Role does not exist (already cleaned up)"
+                  echo ""
+                  return 0
+              fi
+
+              # List and detach managed policies
+              MANAGED_POLICIES=$(aws iam list-attached-role-policies --role-name $role_name --query 'AttachedPolicies[*].PolicyArn' --output text 2>/dev/null || echo "")
+              if [ -n "$MANAGED_POLICIES" ]; then
+                  echo "  Detaching managed policies..."
+                  for policy in $MANAGED_POLICIES; do
+                      aws iam detach-role-policy --role-name $role_name --policy-arn $policy 2>/dev/null && echo "    ✓ Detached $policy" || true
+                  done
+              fi
+
+              # List and delete inline policies
+              INLINE_POLICIES=$(aws iam list-role-policies --role-name $role_name --query 'PolicyNames[*]' --output text 2>/dev/null || echo "")
+              if [ -n "$INLINE_POLICIES" ]; then
+                  echo "  Deleting inline policies..."
+                  for policy in $INLINE_POLICIES; do
+                      aws iam delete-role-policy --role-name $role_name --policy-name $policy 2>/dev/null && echo "    ✓ Deleted $policy" || true
+                  done
+              fi
+
+              # Delete the role
+              echo "  Deleting role..."
+              if aws iam delete-role --role-name $role_name 2>/dev/null; then
+                  echo "  ✓ Role $role_name deleted"
+              else
+                  echo "  ⚠️  Failed to delete role (may not exist)"
+              fi
+              echo ""
+          }
+
+          # Clean up ECS task roles that may be orphaned
+          cleanup_role "${{ parameters.environment }}-litellm-execution-role"
+          cleanup_role "${{ parameters.environment }}-litellm-task-role"
+
+          echo "=========================================="
+          echo "✓ IAM Cleanup Complete"
+          echo "=========================================="
+        failOnStderr: false
+        timeoutInMinutes: 5
+
+    - task: AWSShellScript@1
+      displayName: 'Cleanup orphaned CloudWatch log groups'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo ""
+          echo "=========================================="
+          echo "Cleaning up orphaned CloudWatch log groups..."
+          echo "=========================================="
+          echo ""
+
+          # Clean up Lambda rotation function log group
+          LOG_GROUP="/aws/lambda/${{ parameters.environment }}-litellm-master-key-rotation"
+          if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --query 'logGroups[0].logGroupName' --output text 2>/dev/null | grep -q "$LOG_GROUP"; then
+              echo "Deleting log group: $LOG_GROUP"
+              aws logs delete-log-group --log-group-name "$LOG_GROUP" 2>/dev/null && echo "  ✓ Deleted $LOG_GROUP" || echo "  ⚠️  Failed to delete (may not exist)"
+          else
+              echo "  ✓ Log group does not exist: $LOG_GROUP"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "✓ CloudWatch Cleanup Complete"
+          echo "=========================================="
+        failOnStderr: false
+        timeoutInMinutes: 2
+
+    - bash: |
+        echo ""
+        echo "=========================================="
+        echo "Security Stack Teardown Complete"
+        echo "=========================================="
+        echo ""
+        echo "Deleted resources:"
+        echo "  - KMS encryption keys"
+        echo "  - Secrets Manager secrets (master key, API keys, database credentials)"
+        echo "  - Lambda rotation function"
+        echo "  - IAM roles and policies"
+        echo "  - CloudWatch log groups"
+        echo ""
+        echo "Next steps:"
+        echo "  - If deploying other stacks, ensure they don't depend on security stack"
+        echo "  - Network, ALB, Database, and LiteLLM stacks can now be safely torn down"
+        echo ""
+      displayName: 'Teardown summary'

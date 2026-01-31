@@ -1,0 +1,235 @@
+# Template: Build and Push Docker Image to AWS ECR
+# Authenticates to ECR, builds Docker image, tags, and pushes
+
+parameters:
+- name: repository
+  type: string
+- name: imageTag
+  type: string
+  default: 'latest'
+- name: dockerfilePath
+  type: string
+  default: './Dockerfile'
+- name: dockerContext
+  type: string
+  default: '.'
+- name: awsRegion
+  type: string
+  default: 'us-east-1'
+- name: awsServiceConnection
+  type: string
+  default: 'aws-litellm-connection'
+- name: additionalTags
+  type: object
+  default: []
+
+steps:
+- task: AWSShellScript@1
+  displayName: 'Get AWS Account ID'
+  name: GetAccountId
+  inputs:
+    awsCredentials: '${{ parameters.awsServiceConnection }}'
+    regionName: '${{ parameters.awsRegion }}'
+    scriptType: 'inline'
+    inlineScript: |
+      echo "Getting AWS Account ID..."
+      AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      echo "AWS Account ID: $AWS_ACCOUNT_ID"
+      echo "##vso[task.setvariable variable=AWS_ACCOUNT_ID;isOutput=true]$AWS_ACCOUNT_ID"
+
+      ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${{ parameters.awsRegion }}.amazonaws.com"
+      echo "ECR Registry: $ECR_REGISTRY"
+      echo "##vso[task.setvariable variable=ECR_REGISTRY;isOutput=true]$ECR_REGISTRY"
+
+- task: AWSShellScript@1
+  displayName: 'Authenticate to ECR'
+  inputs:
+    awsCredentials: '${{ parameters.awsServiceConnection }}'
+    regionName: '${{ parameters.awsRegion }}'
+    scriptType: 'inline'
+    inlineScript: |
+      echo "Authenticating to Amazon ECR..."
+
+      aws ecr get-login-password --region ${{ parameters.awsRegion }} | \
+        docker login --username AWS --password-stdin $(GetAccountId.ECR_REGISTRY)
+
+      if [ $? -eq 0 ]; then
+        echo "✓ Successfully authenticated to ECR"
+      else
+        echo "❌ Failed to authenticate to ECR"
+        exit 1
+      fi
+
+- task: AWSShellScript@1
+  displayName: 'Verify ECR repository exists'
+  inputs:
+    awsCredentials: '${{ parameters.awsServiceConnection }}'
+    regionName: '${{ parameters.awsRegion }}'
+    scriptType: 'inline'
+    inlineScript: |
+      echo "Checking if ECR repository '${{ parameters.repository }}' exists..."
+
+      if aws ecr describe-repositories \
+        --repository-names ${{ parameters.repository }} \
+        --region ${{ parameters.awsRegion }} >/dev/null 2>&1; then
+        echo "✓ Repository '${{ parameters.repository }}' found"
+      else
+        echo "⚠️  Repository '${{ parameters.repository }}' not found"
+        echo "Creating ECR repository..."
+
+        aws ecr create-repository \
+          --repository-name ${{ parameters.repository }} \
+          --region ${{ parameters.awsRegion }} \
+          --image-scanning-configuration scanOnPush=true \
+          --encryption-configuration encryptionType=AES256
+
+        if [ $? -eq 0 ]; then
+          echo "✓ Repository created successfully"
+        else
+          echo "❌ Failed to create repository"
+          exit 1
+        fi
+      fi
+    failOnStderr: false
+
+- task: AWSShellScript@1
+  displayName: 'Build Docker image'
+  name: BuildImage
+  inputs:
+    awsCredentials: '${{ parameters.awsServiceConnection }}'
+    regionName: '${{ parameters.awsRegion }}'
+    scriptType: 'inline'
+    inlineScript: |
+      echo "=========================================="
+      echo "Building Docker Image"
+      echo "=========================================="
+
+      ECR_REGISTRY="$(GetAccountId.ECR_REGISTRY)"
+      IMAGE_URI="${ECR_REGISTRY}/${{ parameters.repository }}:${{ parameters.imageTag }}"
+
+      echo "Image URI: $IMAGE_URI"
+      echo "Dockerfile: ${{ parameters.dockerfilePath }}"
+      echo "Build context: ${{ parameters.dockerContext }}"
+
+      # Build Docker image
+      docker build \
+        --no-cache \
+        -t "$IMAGE_URI" \
+        -f "${{ parameters.dockerfilePath }}" \
+        "${{ parameters.dockerContext }}"
+
+      BUILD_STATUS=$?
+      if [ $BUILD_STATUS -ne 0 ]; then
+        echo "❌ Docker build failed"
+        exit 1
+      fi
+
+      echo "✓ Docker image built successfully"
+
+      # List the built image
+      docker images | grep "${{ parameters.repository }}" | head -5
+
+- task: AWSShellScript@1
+  displayName: 'Push Docker image to ECR'
+  name: PushImage
+  inputs:
+    awsCredentials: '${{ parameters.awsServiceConnection }}'
+    regionName: '${{ parameters.awsRegion }}'
+    scriptType: 'inline'
+    inlineScript: |
+      echo "=========================================="
+      echo "Pushing Docker Image to ECR"
+      echo "=========================================="
+
+      ECR_REGISTRY="$(GetAccountId.ECR_REGISTRY)"
+      IMAGE_URI="${ECR_REGISTRY}/${{ parameters.repository }}:${{ parameters.imageTag }}"
+
+      echo "Image URI: $IMAGE_URI"
+
+      # Push primary tag
+      echo "Pushing image with tag: ${{ parameters.imageTag }}"
+      docker push "$IMAGE_URI"
+
+      if [ $? -ne 0 ]; then
+        echo "❌ Failed to push image"
+        exit 1
+      fi
+
+      echo "✓ Image pushed successfully: ${{ parameters.imageTag }}"
+
+      # Set output variable for downstream tasks
+      echo "##vso[task.setvariable variable=IMAGE_URI;isOutput=true]$IMAGE_URI"
+
+      echo ""
+      echo "=========================================="
+      echo "✓ Docker image push completed"
+      echo "=========================================="
+      echo "Repository: ${{ parameters.repository }}"
+      echo "Primary Tag: ${{ parameters.imageTag }}"
+      echo "Image URI: $IMAGE_URI"
+      echo "=========================================="
+    failOnStderr: false
+
+- ${{ if ne(length(parameters.additionalTags), 0) }}:
+  - ${{ each tag in parameters.additionalTags }}:
+    - task: AWSShellScript@1
+      displayName: 'Tag and push: ${{ tag }}'
+      inputs:
+        awsCredentials: '${{ parameters.awsServiceConnection }}'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "Tagging and pushing: ${{ tag }}"
+
+          ECR_REGISTRY="$(GetAccountId.ECR_REGISTRY)"
+          SOURCE_IMAGE="${ECR_REGISTRY}/${{ parameters.repository }}:${{ parameters.imageTag }}"
+          ADDITIONAL_TAG="${ECR_REGISTRY}/${{ parameters.repository }}:${{ tag }}"
+
+          echo "Source: $SOURCE_IMAGE"
+          echo "Target: $ADDITIONAL_TAG"
+
+          # Tag the image
+          docker tag "$SOURCE_IMAGE" "$ADDITIONAL_TAG"
+
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to tag image"
+            exit 1
+          fi
+
+          # Push the tag
+          docker push "$ADDITIONAL_TAG"
+
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to push tag: ${{ tag }}"
+            exit 1
+          fi
+
+          echo "✓ Successfully pushed: ${{ tag }}"
+        failOnStderr: false
+
+- task: AWSShellScript@1
+  displayName: 'Verify image in ECR'
+  inputs:
+    awsCredentials: '${{ parameters.awsServiceConnection }}'
+    regionName: '${{ parameters.awsRegion }}'
+    scriptType: 'inline'
+    inlineScript: |
+      echo "Verifying image in ECR..."
+
+      # Use JSON output to handle multiple tags properly
+      IMAGE_INFO=$(aws ecr describe-images \
+        --repository-name ${{ parameters.repository }} \
+        --image-ids imageTag=${{ parameters.imageTag }} \
+        --region ${{ parameters.awsRegion }} \
+        --query 'imageDetails[0]' \
+        --output json 2>&1)
+
+      if [ $? -eq 0 ]; then
+        echo "✓ Image found in ECR"
+        echo "$IMAGE_INFO" | jq -r '"Tags: \(.imageTags | join(", "))\nSize: \(.imageSizeInBytes / 1024 / 1024 | round)MB\nPushed: \(.imagePushedAt)"'
+      else
+        echo "⚠️  Could not verify image in ECR (may not be critical)"
+        echo "$IMAGE_INFO"
+        # Don't fail - verification is informational only
+      fi
+    failOnStderr: false

@@ -1,0 +1,509 @@
+# Azure Pipeline: Pre-Deployment Validation
+# Purpose:
+#   - Validate all CloudFormation templates before deployment
+#   - Check stack dependencies and ordering
+#   - Verify configurations and environment variables
+#   - Ensure ALB listener rules are properly configured
+#   - Check for common issues that could cause deployment failures
+# Trigger: Manual only (run before deployments)
+
+trigger: none
+
+pr: none
+
+parameters:
+- name: environment
+  displayName: 'Environment to validate'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+- name: checkDeployedStacks
+  displayName: 'Check deployed stack status in AWS'
+  type: string
+  default: 'true'
+  values:
+  - 'true'
+  - 'false'
+
+variables:
+- group: litellm-aws-config
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: ValidateTemplates
+  displayName: 'Validate CloudFormation Templates'
+  jobs:
+  - job: TemplateValidation
+    displayName: 'Validate All Templates'
+    steps:
+    - checkout: self
+      displayName: 'Checkout repository'
+
+    - task: Bash@3
+      displayName: 'Validate CloudFormation Template Syntax'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "=========================================="
+          echo "CloudFormation Template Validation"
+          echo "=========================================="
+          echo ""
+
+          TEMPLATES=(
+            "infrastructure/security-stack.yaml"
+            "infrastructure/network-stack.yaml"
+            "infrastructure/alb-stack.yaml"
+            "infrastructure/database-stack.yaml"
+            "infrastructure/litellm-stack.yaml"
+          )
+
+          VALIDATION_ERRORS=0
+
+          for TEMPLATE in "${TEMPLATES[@]}"; do
+            echo "Validating: $TEMPLATE"
+
+            if [ ! -f "$TEMPLATE" ]; then
+              echo "  ❌ File not found"
+              VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+              continue
+            fi
+
+            # Check YAML syntax
+            if ! python3 -c "import yaml; yaml.safe_load(open('$TEMPLATE'))" 2>/dev/null; then
+              echo "  ❌ Invalid YAML syntax"
+              VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+              continue
+            fi
+
+            echo "  ✓ Valid YAML syntax"
+
+            # Check for required sections
+            if ! grep -q "AWSTemplateFormatVersion" "$TEMPLATE"; then
+              echo "  ⚠️  Missing AWSTemplateFormatVersion"
+            fi
+
+            if ! grep -q "Description:" "$TEMPLATE"; then
+              echo "  ⚠️  Missing Description"
+            fi
+
+            if ! grep -q "Parameters:" "$TEMPLATE"; then
+              echo "  ℹ️  No Parameters section"
+            fi
+
+            if ! grep -q "Resources:" "$TEMPLATE"; then
+              echo "  ❌ Missing Resources section"
+              VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+              continue
+            fi
+
+            echo "  ✓ Template structure valid"
+            echo ""
+          done
+
+          if [ $VALIDATION_ERRORS -gt 0 ]; then
+            echo "❌ Validation failed with $VALIDATION_ERRORS error(s)"
+            exit 1
+          else
+            echo "✓ All templates validated successfully"
+          fi
+
+    - task: Bash@3
+      displayName: 'Check for Template Mix-ups'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "=========================================="
+          echo "Checking for Common Template Issues"
+          echo "=========================================="
+          echo ""
+
+          # Check litellm-stack.yaml doesn't contain VPC resources (should import)
+          if grep -q "Type: AWS::EC2::VPC" infrastructure/litellm-stack.yaml; then
+            echo "❌ CRITICAL: litellm-stack.yaml contains VPC resources!"
+            echo "   This indicates ecs-stack.yaml (deprecated) is being used"
+            echo "   Should be using litellm-stack.yaml (modular)"
+            exit 1
+          else
+            echo "✓ litellm-stack.yaml correctly uses VPC imports"
+          fi
+
+          # Check network-stack.yaml DOES contain VPC resources
+          if ! grep -q "Type: AWS::EC2::VPC" infrastructure/network-stack.yaml; then
+            echo "❌ CRITICAL: network-stack.yaml missing VPC resources!"
+            exit 1
+          else
+            echo "✓ network-stack.yaml correctly defines VPC"
+          fi
+
+          # Check for old ecs-stack.yaml reference
+          if [ -f "infrastructure/ecs-stack.yaml" ]; then
+            echo "⚠️  WARNING: ecs-stack.yaml still exists (deprecated)"
+            echo "   Consider removing to avoid confusion"
+          fi
+
+          echo ""
+          echo "✓ No template mix-up issues detected"
+
+- stage: ValidateConfiguration
+  displayName: 'Validate Configuration'
+  dependsOn: ValidateTemplates
+  jobs:
+  - job: ConfigValidation
+    displayName: 'Validate LiteLLM Configuration'
+    steps:
+    - checkout: self
+
+    - task: Bash@3
+      displayName: 'Validate config.yaml'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "=========================================="
+          echo "LiteLLM Configuration Validation"
+          echo "=========================================="
+          echo ""
+
+          if [ ! -f "config.yaml" ]; then
+            echo "❌ config.yaml not found"
+            exit 1
+          fi
+
+          # Validate YAML syntax
+          if ! python3 -c "import yaml; yaml.safe_load(open('config.yaml'))" 2>/dev/null; then
+            echo "❌ config.yaml has invalid YAML syntax"
+            exit 1
+          fi
+
+          echo "✓ config.yaml has valid syntax"
+
+          # Check required sections
+          if ! grep -q "model_list:" config.yaml; then
+            echo "❌ Missing model_list section"
+            exit 1
+          fi
+
+          if ! grep -q "general_settings:" config.yaml; then
+            echo "⚠️  Missing general_settings section"
+          fi
+
+          # Count models
+          MODEL_COUNT=$(python3 -c "import yaml; print(len(yaml.safe_load(open('config.yaml')).get('model_list', [])))")
+          echo "✓ Configuration has $MODEL_COUNT model(s) defined"
+
+          echo ""
+          echo "✓ Configuration validation passed"
+
+    - task: Bash@3
+      displayName: 'Check Required Environment Variables'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "=========================================="
+          echo "Environment Variable Configuration Check"
+          echo "=========================================="
+          echo ""
+
+          echo "Checking litellm-stack.yaml for required environment variables..."
+
+          REQUIRED_VARS=(
+            "LITELLM_LOG"
+            "STORE_MODEL_IN_DB"
+            "LITELLM_MODE"
+            "UI_ACCESS_MODE"
+          )
+
+          REQUIRED_SECRETS=(
+            "LITELLM_MASTER_KEY"
+            "UI_USERNAME"
+            "UI_PASSWORD"
+            "DATABASE_URL"
+          )
+
+          MISSING_VARS=0
+
+          for VAR in "${REQUIRED_VARS[@]}"; do
+            if grep -q "Name: $VAR" infrastructure/litellm-stack.yaml; then
+              echo "  ✓ $VAR configured"
+            else
+              echo "  ❌ $VAR missing"
+              MISSING_VARS=$((MISSING_VARS + 1))
+            fi
+          done
+
+          echo ""
+          echo "Checking for required secrets..."
+          for SECRET in "${REQUIRED_SECRETS[@]}"; do
+            if grep -q "Name: $SECRET" infrastructure/litellm-stack.yaml; then
+              echo "  ✓ $SECRET configured"
+            else
+              echo "  ❌ $SECRET missing"
+              MISSING_VARS=$((MISSING_VARS + 1))
+            fi
+          done
+
+          if [ $MISSING_VARS -gt 0 ]; then
+            echo ""
+            echo "❌ $MISSING_VARS required variable(s) missing"
+            exit 1
+          fi
+
+          echo ""
+          echo "✓ All required environment variables configured"
+
+    - task: Bash@3
+      displayName: 'Validate ALB Listener Rules'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "=========================================="
+          echo "ALB Listener Rules Validation"
+          echo "=========================================="
+          echo ""
+
+          echo "Checking for required listener rules in litellm-stack.yaml..."
+
+          REQUIRED_RULES=(
+            "ListenerRuleV1"
+            "ListenerRuleHealth"
+            "ListenerRuleUI"
+            "ListenerRuleCatchAll"
+          )
+
+          MISSING_RULES=0
+
+          for RULE in "${REQUIRED_RULES[@]}"; do
+            if grep -q "$RULE:" infrastructure/litellm-stack.yaml; then
+              echo "  ✓ $RULE defined"
+
+              # Check priority
+              PRIORITY=$(grep -A 5 "$RULE:" infrastructure/litellm-stack.yaml | grep "Priority:" | head -1 | sed 's/.*Priority: //')
+              if [ -n "$PRIORITY" ]; then
+                echo "    Priority: $PRIORITY"
+              fi
+            else
+              echo "  ❌ $RULE missing"
+              MISSING_RULES=$((MISSING_RULES + 1))
+            fi
+          done
+
+          if [ $MISSING_RULES -gt 0 ]; then
+            echo ""
+            echo "❌ $MISSING_RULES required listener rule(s) missing"
+            echo ""
+            echo "CRITICAL: Missing listener rules will cause:"
+            echo "  - UI assets to fail loading"
+            echo "  - Admin API endpoints to return 'LiteLLM API - Healthy'"
+            echo "  - Documentation pages to not work"
+            exit 1
+          fi
+
+          # Verify catch-all rule has correct path pattern
+          if grep -A 10 "ListenerRuleCatchAll:" infrastructure/litellm-stack.yaml | grep -q "'/*'"; then
+            echo "  ✓ Catch-all rule has correct path pattern (/*)"
+          else
+            echo "  ⚠️  Catch-all rule path pattern may be incorrect"
+          fi
+
+          echo ""
+          echo "✓ All required listener rules configured"
+
+- stage: ValidateDeployedStacks
+  displayName: 'Validate Deployed Stacks (AWS)'
+  dependsOn: ValidateConfiguration
+  condition: and(succeeded(), eq('${{ parameters.checkDeployedStacks }}', 'true'))
+  jobs:
+  - job: AWSValidation
+    displayName: 'Check AWS Stack Status'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Check Stack Dependencies'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "AWS Stack Dependency Validation"
+          echo "=========================================="
+          echo ""
+
+          STACKS=(
+            "${{ parameters.environment }}-security-stack"
+            "${{ parameters.environment }}-network-stack"
+            "${{ parameters.environment }}-alb-stack"
+            "${{ parameters.environment }}-database-stack"
+            "${{ parameters.environment }}-litellm-stack"
+          )
+
+          echo "Checking stack status in deployment order..."
+          echo ""
+
+          MISSING_STACKS=0
+          UNHEALTHY_STACKS=0
+
+          for STACK in "${STACKS[@]}"; do
+            echo "Checking: $STACK"
+
+            STATUS=$(aws cloudformation describe-stacks \
+              --stack-name $STACK \
+              --region ${{ parameters.awsRegion }} \
+              --query 'Stacks[0].StackStatus' \
+              --output text 2>/dev/null || echo "NOT_FOUND")
+
+            if [ "$STATUS" = "NOT_FOUND" ]; then
+              echo "  ⚠️  Stack does not exist"
+              MISSING_STACKS=$((MISSING_STACKS + 1))
+            elif [ "$STATUS" = "CREATE_COMPLETE" ] || [ "$STATUS" = "UPDATE_COMPLETE" ]; then
+              echo "  ✓ Status: $STATUS"
+            else
+              echo "  ⚠️  Status: $STATUS (may need attention)"
+              UNHEALTHY_STACKS=$((UNHEALTHY_STACKS + 1))
+            fi
+          done
+
+          echo ""
+          echo "Summary:"
+          echo "  Missing stacks: $MISSING_STACKS"
+          echo "  Unhealthy stacks: $UNHEALTHY_STACKS"
+
+          if [ $UNHEALTHY_STACKS -gt 0 ]; then
+            echo ""
+            echo "⚠️  Some stacks are not in a healthy state"
+            echo "    Review stack status before deploying"
+          fi
+
+    - task: AWSShellScript@1
+      displayName: 'Verify Secrets Exist'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "AWS Secrets Manager Validation"
+          echo "=========================================="
+          echo ""
+
+          REQUIRED_SECRETS=(
+            "${{ parameters.environment }}/litellm/master-key"
+            "${{ parameters.environment }}/litellm/api-keys"
+            "${{ parameters.environment }}/litellm/database"
+          )
+
+          MISSING_SECRETS=0
+
+          for SECRET in "${REQUIRED_SECRETS[@]}"; do
+            echo "Checking: $SECRET"
+
+            if aws secretsmanager describe-secret --secret-id $SECRET --region ${{ parameters.awsRegion }} >/dev/null 2>&1; then
+              echo "  ✓ Secret exists"
+
+              # Check for required keys in master-key secret
+              if [[ "$SECRET" == *"master-key"* ]]; then
+                KEYS=$(aws secretsmanager get-secret-value --secret-id $SECRET --region ${{ parameters.awsRegion }} --query 'SecretString' --output text | jq -r 'keys[]' 2>/dev/null)
+
+                if echo "$KEYS" | grep -q "LITELLM_MASTER_KEY"; then
+                  echo "    ✓ LITELLM_MASTER_KEY present"
+                fi
+                if echo "$KEYS" | grep -q "UI_USERNAME"; then
+                  echo "    ✓ UI_USERNAME present"
+                else
+                  echo "    ⚠️  UI_USERNAME missing (admin UI won't work)"
+                fi
+                if echo "$KEYS" | grep -q "UI_PASSWORD"; then
+                  echo "    ✓ UI_PASSWORD present"
+                else
+                  echo "    ⚠️  UI_PASSWORD missing (admin UI won't work)"
+                fi
+              fi
+
+              # Check for DATABASE_URL in database secret
+              if [[ "$SECRET" == *"database"* ]]; then
+                KEYS=$(aws secretsmanager get-secret-value --secret-id $SECRET --region ${{ parameters.awsRegion }} --query 'SecretString' --output text | jq -r 'keys[]' 2>/dev/null)
+
+                if echo "$KEYS" | grep -q "DATABASE_URL"; then
+                  echo "    ✓ DATABASE_URL present"
+                else
+                  echo "    ⚠️  DATABASE_URL missing (LiteLLM won't start)"
+                fi
+              fi
+            else
+              echo "  ❌ Secret not found"
+              MISSING_SECRETS=$((MISSING_SECRETS + 1))
+            fi
+          done
+
+          if [ $MISSING_SECRETS -gt 0 ]; then
+            echo ""
+            echo "⚠️  $MISSING_SECRETS required secret(s) missing"
+            echo "    Create secrets before deploying"
+          else
+            echo ""
+            echo "✓ All required secrets exist"
+          fi
+
+- stage: ValidationReport
+  displayName: 'Generate Validation Report'
+  dependsOn:
+    - ValidateTemplates
+    - ValidateConfiguration
+    - ValidateDeployedStacks
+  condition: always()
+  jobs:
+  - job: Report
+    displayName: 'Validation Summary'
+    steps:
+    - checkout: none
+
+    - task: Bash@3
+      displayName: 'Generate Summary Report'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "=========================================="
+          echo "PRE-DEPLOYMENT VALIDATION REPORT"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ parameters.environment }}"
+          echo "Region: ${{ parameters.awsRegion }}"
+          echo "Validation Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+          echo "Validation stages completed:"
+          echo "  ✓ CloudFormation template validation"
+          echo "  ✓ Configuration file validation"
+          echo "  ✓ Environment variable checks"
+          echo "  ✓ ALB listener rule validation"
+          if [ "${{ parameters.checkDeployedStacks }}" = "true" ]; then
+            echo "  ✓ AWS stack status checks"
+            echo "  ✓ Secrets Manager validation"
+          fi
+          echo ""
+          echo "=========================================="
+          echo "DEPLOYMENT READINESS"
+          echo "=========================================="
+          echo ""
+          echo "If all checks passed above, you can proceed with deployment in this order:"
+          echo ""
+          echo "1. security-stack  (KMS, Secrets Manager, IAM roles)"
+          echo "2. network-stack   (VPC, subnets, security groups)"
+          echo "3. alb-stack       (Application Load Balancer, listeners)"
+          echo "4. database-stack  (RDS PostgreSQL)"
+          echo "5. litellm-stack   (ECS service, task definition)"
+          echo ""
+          echo "For updates to existing stacks, use:"
+          echo "  - azure-pipelines-litellm-update.yml with mode=config"
+          echo ""
+          echo "=========================================="

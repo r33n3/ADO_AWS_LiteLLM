@@ -1,0 +1,447 @@
+# Template: Deploy AWS CloudFormation Stack
+# Validates, creates/updates CloudFormation stacks with parameters
+
+parameters:
+- name: stackName
+  type: string
+- name: templateFile
+  type: string
+- name: parameters
+  type: string
+  default: ''
+- name: capabilities
+  type: string
+  default: 'CAPABILITY_IAM CAPABILITY_NAMED_IAM'
+- name: awsRegion
+  type: string
+  default: 'us-east-1'
+- name: awsServiceConnection
+  type: string
+  default: 'aws-litellm-connection'
+- name: tags
+  type: string
+  default: ''
+
+steps:
+- task: AWSShellScript@1
+  displayName: 'Validate CloudFormation template'
+  inputs:
+    awsCredentials: '${{ parameters.awsServiceConnection }}'
+    regionName: '${{ parameters.awsRegion }}'
+    scriptType: 'inline'
+    inlineScript: |
+      echo "Validating CloudFormation template: ${{ parameters.templateFile }}"
+
+      if [ ! -f "${{ parameters.templateFile }}" ]; then
+        echo "❌ Template file not found: ${{ parameters.templateFile }}"
+        exit 1
+      fi
+
+      aws cloudformation validate-template \
+        --template-body file://${{ parameters.templateFile }} \
+        --region ${{ parameters.awsRegion }}
+
+      if [ $? -eq 0 ]; then
+        echo "✓ Template validation successful"
+      else
+        echo "❌ Template validation failed"
+        exit 1
+      fi
+
+- task: AWSShellScript@1
+  displayName: 'Deploy CloudFormation stack: ${{ parameters.stackName }}'
+  inputs:
+    awsCredentials: '${{ parameters.awsServiceConnection }}'
+    regionName: '${{ parameters.awsRegion }}'
+    scriptType: 'inline'
+    inlineScript: |
+      echo "=========================================="
+      echo "Deploying CloudFormation Stack"
+      echo "=========================================="
+      echo "Stack Name: ${{ parameters.stackName }}"
+      echo "Template: ${{ parameters.templateFile }}"
+      echo "Region: ${{ parameters.awsRegion }}"
+      echo "=========================================="
+
+      # Check if stack exists
+      echo "Checking if stack exists..."
+      STACK_EXISTS=$(aws cloudformation describe-stacks \
+        --stack-name ${{ parameters.stackName }} \
+        --region ${{ parameters.awsRegion }} \
+        2>/dev/null && echo "yes" || echo "no")
+
+      if [ "$STACK_EXISTS" = "yes" ]; then
+        STACK_STATUS=$(aws cloudformation describe-stacks \
+          --stack-name ${{ parameters.stackName }} \
+          --region ${{ parameters.awsRegion }} \
+          --query 'Stacks[0].StackStatus' \
+          --output text)
+        echo "Stack exists with status: $STACK_STATUS"
+
+        # Handle transient states - wait for completion before proceeding
+        if [[ "$STACK_STATUS" == *"_IN_PROGRESS"* ]]; then
+          echo ""
+          echo "⏳ Stack is in transient state: $STACK_STATUS"
+          echo "⏳ Waiting for operation to complete before proceeding..."
+          echo ""
+
+          # Determine which wait command to use based on current status
+          if [[ "$STACK_STATUS" == "CREATE_IN_PROGRESS" ]]; then
+            echo "Waiting for stack creation to complete..."
+            aws cloudformation wait stack-create-complete \
+              --stack-name ${{ parameters.stackName }} \
+              --region ${{ parameters.awsRegion }}
+            WAIT_EXIT=$?
+          elif [[ "$STACK_STATUS" == "UPDATE_IN_PROGRESS" ]] || [[ "$STACK_STATUS" == "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS" ]]; then
+            echo "Waiting for stack update to complete..."
+            aws cloudformation wait stack-update-complete \
+              --stack-name ${{ parameters.stackName }} \
+              --region ${{ parameters.awsRegion }}
+            WAIT_EXIT=$?
+          elif [[ "$STACK_STATUS" == "DELETE_IN_PROGRESS" ]]; then
+            echo "Waiting for stack deletion to complete..."
+            aws cloudformation wait stack-delete-complete \
+              --stack-name ${{ parameters.stackName }} \
+              --region ${{ parameters.awsRegion }}
+            WAIT_EXIT=$?
+            # After deletion completes, stack no longer exists
+            STACK_EXISTS="no"
+          elif [[ "$STACK_STATUS" == "ROLLBACK_IN_PROGRESS" ]]; then
+            echo "Waiting for rollback to complete..."
+            aws cloudformation wait stack-rollback-complete \
+              --stack-name ${{ parameters.stackName }} \
+              --region ${{ parameters.awsRegion }}
+            WAIT_EXIT=$?
+          else
+            echo "⚠️  Unhandled in-progress state: $STACK_STATUS"
+            echo "⚠️  Waiting 30 seconds and checking again..."
+            sleep 30
+            WAIT_EXIT=1
+          fi
+
+          # Re-check status after wait
+          if [ $WAIT_EXIT -eq 0 ] || [ $WAIT_EXIT -eq 255 ]; then
+            STACK_STATUS=$(aws cloudformation describe-stacks \
+              --stack-name ${{ parameters.stackName }} \
+              --region ${{ parameters.awsRegion }} \
+              --query 'Stacks[0].StackStatus' \
+              --output text 2>/dev/null || echo "STACK_DELETED")
+            echo "✓ Operation completed. New status: $STACK_STATUS"
+          else
+            echo "❌ Wait command failed or timed out"
+            exit 1
+          fi
+        fi
+
+        # Handle ROLLBACK_COMPLETE - stack needs to be deleted and recreated
+        if [[ "$STACK_STATUS" == "ROLLBACK_COMPLETE" ]]; then
+          echo ""
+          echo "⚠️  Stack is in ROLLBACK_COMPLETE state (previous creation failed)"
+          echo "⚠️  Stack must be deleted before it can be recreated"
+          echo "🗑️  Deleting stack: ${{ parameters.stackName }}"
+
+          aws cloudformation delete-stack \
+            --stack-name ${{ parameters.stackName }} \
+            --region ${{ parameters.awsRegion }}
+
+          echo "⏳ Waiting for stack deletion to complete..."
+          aws cloudformation wait stack-delete-complete \
+            --stack-name ${{ parameters.stackName }} \
+            --region ${{ parameters.awsRegion }}
+
+          echo "✓ Stack deleted successfully. Will create new stack."
+          STACK_EXISTS="no"
+        fi
+
+      else
+        echo "Stack does not exist, will create new stack"
+      fi
+
+      # Build parameters string for create-stack/update-stack
+      PARAMS_STRING=""
+      if [ -n "${{ parameters.parameters }}" ]; then
+        # Convert parameter-overrides format to parameters format
+        # From: Key1=Value1 Key2=Value2
+        # To: ParameterKey=Key1,ParameterValue=Value1 ParameterKey=Key2,ParameterValue=Value2
+        for param in ${{ parameters.parameters }}; do
+          KEY=$(echo $param | cut -d'=' -f1)
+          VALUE=$(echo $param | cut -d'=' -f2-)
+          PARAMS_STRING="$PARAMS_STRING ParameterKey=$KEY,ParameterValue=$VALUE"
+        done
+        echo "Parameters: $PARAMS_STRING"
+      fi
+
+      # Build tags string if provided
+      TAGS_STRING=""
+      if [ -n "${{ parameters.tags }}" ]; then
+        # Convert tags format
+        for tag in ${{ parameters.tags }}; do
+          KEY=$(echo $tag | cut -d'=' -f1)
+          VALUE=$(echo $tag | cut -d'=' -f2-)
+          TAGS_STRING="$TAGS_STRING Key=$KEY,Value=$VALUE"
+        done
+      fi
+
+      echo "=========================================="
+      echo "Template File Verification:"
+      echo "=========================================="
+      echo "Current working directory: $(pwd)"
+      echo "Template path (parameter): ${{ parameters.templateFile }}"
+      echo ""
+      echo "Repository files:"
+      ls -lh infrastructure/*.yaml
+      echo ""
+      echo "File details for template:"
+      ls -lh "${{ parameters.templateFile }}"
+      echo ""
+      echo "Template first 10 lines:"
+      head -10 "${{ parameters.templateFile }}"
+      echo ""
+      echo "MD5 hash of template:"
+      md5sum "${{ parameters.templateFile }}"
+      echo ""
+      echo "Verifying template content (anti-wrong-file check):"
+      if grep -q "Complete Infrastructure Stack" "${{ parameters.templateFile }}"; then
+        echo "❌ FATAL ERROR: Template contains 'Complete Infrastructure Stack'"
+        echo "❌ This indicates ecs-stack.yaml (monolithic) is being used"
+        echo "❌ Expected: litellm-stack.yaml (modular)"
+        echo "❌ Stack name: ${{ parameters.stackName }}"
+        echo "❌ Template param: ${{ parameters.templateFile }}"
+        exit 1
+      elif grep -q "LiteLLM Application Stack" "${{ parameters.templateFile }}"; then
+        echo "✓ Template verified: LiteLLM Application Stack (modular - correct!)"
+      else
+        echo "⚠️  Warning: Could not verify template type"
+      fi
+      echo ""
+      echo "=========================================="
+      echo "Executing deployment..."
+      echo "=========================================="
+
+      if [ "$STACK_EXISTS" = "no" ]; then
+        #############################################################################
+        # CREATE NEW STACK (bypasses changeset hooks)
+        #############################################################################
+        echo "Creating new stack: ${{ parameters.stackName }}"
+
+        # CRITICAL: Use template file parameter directly
+        TEMPLATE_FILE="${{ parameters.templateFile }}"
+        echo "Template file to deploy: $TEMPLATE_FILE"
+
+        echo ""
+        echo "=========================================="
+        echo "FINAL PRE-DEPLOYMENT FILE VERIFICATION"
+        echo "=========================================="
+        echo "About to deploy this file to CloudFormation:"
+        echo "File: $TEMPLATE_FILE"
+        echo "First 5 lines:"
+        head -5 "$TEMPLATE_FILE"
+        echo ""
+        echo "Checking template type (prevent deprecated ecs-stack.yaml):"
+        if [[ "${{ parameters.stackName }}" == *"-network-stack" ]]; then
+          # Network stack SHOULD have VPC resources
+          if grep -q "Type: AWS::EC2::VPC" "$TEMPLATE_FILE"; then
+            echo "✓ Network stack contains VPC resources (correct)"
+          else
+            echo "❌ FATAL: Network stack missing VPC resources!"
+            exit 1
+          fi
+        elif [[ "${{ parameters.stackName }}" == *"-litellm-stack" ]]; then
+          # LiteLLM stack should NOT have VPC resources (uses imports)
+          if grep -q "Type: AWS::EC2::VPC" "$TEMPLATE_FILE"; then
+            echo "❌ FATAL: LiteLLM stack contains VPC - this is ecs-stack.yaml!"
+            echo "❌ Expected: litellm-stack.yaml (modular), Got: ecs-stack.yaml (deprecated)"
+            exit 1
+          else
+            echo "✓ LiteLLM stack uses VPC imports (correct)"
+          fi
+        else
+          # For other stacks, just verify it's not the deprecated all-in-one template
+          if grep -q "Complete Infrastructure Stack" "$TEMPLATE_FILE"; then
+            echo "❌ FATAL: Deprecated ecs-stack.yaml detected!"
+            exit 1
+          else
+            echo "✓ Template type check passed"
+          fi
+        fi
+        echo "=========================================="
+        echo ""
+
+        CREATE_CMD="aws cloudformation create-stack \
+          --stack-name ${{ parameters.stackName }} \
+          --template-body file://${TEMPLATE_FILE} \
+          --region ${{ parameters.awsRegion }}"
+
+        # Add capabilities
+        if [ -n "${{ parameters.capabilities }}" ]; then
+          CREATE_CMD="$CREATE_CMD --capabilities ${{ parameters.capabilities }}"
+        fi
+
+        # Add parameters
+        if [ -n "$PARAMS_STRING" ]; then
+          CREATE_CMD="$CREATE_CMD --parameters $PARAMS_STRING"
+        fi
+
+        # Add tags
+        if [ -n "$TAGS_STRING" ]; then
+          CREATE_CMD="$CREATE_CMD --tags $TAGS_STRING"
+        fi
+
+        echo "Executing: create-stack"
+        echo "Full command: $CREATE_CMD"
+        eval $CREATE_CMD
+        CREATE_EXIT=$?
+
+        if [ $CREATE_EXIT -eq 0 ]; then
+          echo "✓ Stack creation initiated"
+
+          echo ""
+          echo "=========================================="
+          echo "POST-DEPLOYMENT VERIFICATION"
+          echo "=========================================="
+          echo "Retrieving template from CloudFormation to verify what was deployed..."
+          sleep 5
+
+          CF_TEMPLATE_DESC=$(aws cloudformation get-template \
+            --stack-name ${{ parameters.stackName }} \
+            --region ${{ parameters.awsRegion }} \
+            --query 'TemplateBody' \
+            --output text 2>&1 | head -10)
+
+          echo "CloudFormation template first 10 lines:"
+          echo "$CF_TEMPLATE_DESC"
+
+          if echo "$CF_TEMPLATE_DESC" | grep -q "Complete Infrastructure Stack"; then
+            echo ""
+            echo "❌ CRITICAL ERROR: CloudFormation received ecs-stack.yaml (monolithic)!"
+            echo "❌ But we verified litellm-stack.yaml (modular) before deployment!"
+            echo "❌ This indicates a CloudFormation CLI or file reading bug!"
+          elif echo "$CF_TEMPLATE_DESC" | grep -q "LiteLLM Application Stack"; then
+            echo "✓ CloudFormation received correct template (modular)"
+          fi
+          echo "=========================================="
+          echo ""
+        else
+          echo "❌ Stack creation failed"
+          exit 1
+        fi
+
+      else
+        #############################################################################
+        # UPDATE EXISTING STACK (direct update, no changeset)
+        #############################################################################
+        echo "Updating existing stack: ${{ parameters.stackName }}"
+
+        # CRITICAL: Use template file parameter directly
+        TEMPLATE_FILE="${{ parameters.templateFile }}"
+        echo "Template file to deploy: $TEMPLATE_FILE"
+
+        UPDATE_CMD="aws cloudformation update-stack \
+          --stack-name ${{ parameters.stackName }} \
+          --template-body file://${TEMPLATE_FILE} \
+          --region ${{ parameters.awsRegion }}"
+
+        # Add capabilities
+        if [ -n "${{ parameters.capabilities }}" ]; then
+          UPDATE_CMD="$UPDATE_CMD --capabilities ${{ parameters.capabilities }}"
+        fi
+
+        # Add parameters
+        if [ -n "$PARAMS_STRING" ]; then
+          UPDATE_CMD="$UPDATE_CMD --parameters $PARAMS_STRING"
+        fi
+
+        # Add tags
+        if [ -n "$TAGS_STRING" ]; then
+          UPDATE_CMD="$UPDATE_CMD --tags $TAGS_STRING"
+        fi
+
+        echo "Executing: update-stack"
+        UPDATE_OUTPUT=$(eval $UPDATE_CMD 2>&1)
+        UPDATE_EXIT=$?
+
+        if [ $UPDATE_EXIT -eq 0 ]; then
+          echo "✓ Stack update initiated"
+        elif echo "$UPDATE_OUTPUT" | grep -q "No updates are to be performed"; then
+          echo "ℹ No updates needed - stack is already up to date"
+          UPDATE_EXIT=0
+        else
+          echo "❌ Stack update failed"
+          echo "$UPDATE_OUTPUT"
+          exit 1
+        fi
+      fi
+
+      # Set exit code for next step
+      DEPLOY_EXIT=${CREATE_EXIT:-$UPDATE_EXIT}
+
+      if [ $? -eq 0 ]; then
+        echo ""
+        echo "=========================================="
+        echo "✓ Stack deployment successful"
+        echo "=========================================="
+
+        # Get stack outputs
+        echo ""
+        echo "Stack Outputs:"
+        aws cloudformation describe-stacks \
+          --stack-name ${{ parameters.stackName }} \
+          --region ${{ parameters.awsRegion }} \
+          --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue,Description]' \
+          --output table
+
+        # Get stack status
+        STACK_STATUS=$(aws cloudformation describe-stacks \
+          --stack-name ${{ parameters.stackName }} \
+          --region ${{ parameters.awsRegion }} \
+          --query 'Stacks[0].StackStatus' \
+          --output text)
+        echo ""
+        echo "Stack Status: $STACK_STATUS"
+
+      else
+        echo ""
+        echo "=========================================="
+        echo "❌ Stack deployment failed"
+        echo "=========================================="
+        exit 1
+      fi
+    failOnStderr: false
+
+- task: AWSShellScript@1
+  displayName: 'Wait for stack to be ready'
+  inputs:
+    awsCredentials: '${{ parameters.awsServiceConnection }}'
+    regionName: '${{ parameters.awsRegion }}'
+    scriptType: 'inline'
+    inlineScript: |
+      echo "Waiting for stack ${{ parameters.stackName }} to be ready..."
+
+      aws cloudformation wait stack-create-complete \
+        --stack-name ${{ parameters.stackName }} \
+        --region ${{ parameters.awsRegion }} 2>/dev/null || \
+      aws cloudformation wait stack-update-complete \
+        --stack-name ${{ parameters.stackName }} \
+        --region ${{ parameters.awsRegion }} 2>/dev/null
+
+      WAIT_STATUS=$?
+
+      if [ $WAIT_STATUS -eq 0 ] || [ $WAIT_STATUS -eq 255 ]; then
+        echo "✓ Stack is ready"
+      else
+        echo "⚠️  Stack wait returned status: $WAIT_STATUS"
+        # Check actual stack status
+        STACK_STATUS=$(aws cloudformation describe-stacks \
+          --stack-name ${{ parameters.stackName }} \
+          --region ${{ parameters.awsRegion }} \
+          --query 'Stacks[0].StackStatus' \
+          --output text)
+
+        if [[ "$STACK_STATUS" == "CREATE_COMPLETE" ]] || [[ "$STACK_STATUS" == "UPDATE_COMPLETE" ]]; then
+          echo "✓ Stack status is $STACK_STATUS"
+        else
+          echo "❌ Stack status is $STACK_STATUS"
+          exit 1
+        fi
+      fi
+    failOnStderr: false

@@ -1,0 +1,670 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  LiteLLM Application Stack - ECS Cluster, Service, Task Definition, CloudWatch
+  Owner: Dev Team
+  Deploy Order: 5 (after database-stack)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  ContainerImage:
+    Type: String
+    Description: Docker image URI for LiteLLM container
+
+  ContainerCpu:
+    Type: Number
+    Default: 512
+    AllowedValues:
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+    Description: CPU units for container (256 = 0.25 vCPU)
+
+  ContainerMemory:
+    Type: Number
+    Default: 1024
+    AllowedValues:
+      - 512
+      - 1024
+      - 2048
+      - 4096
+      - 8192
+    Description: Memory for container in MB
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: Desired number of ECS tasks
+
+  MinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: Minimum number of tasks for auto-scaling
+
+  MaxCapacity:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 20
+    Description: Maximum number of tasks for auto-scaling
+
+  EnableAutoScaling:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable auto-scaling based on CPU/Memory
+
+  HealthCheckGracePeriod:
+    Type: Number
+    Default: 600
+    MinValue: 0
+    MaxValue: 1800
+    Description: Seconds to wait before starting health checks on new tasks
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 180
+      - 365
+    Description: CloudWatch log retention period
+
+
+  CostCenter:
+    Type: String
+    Default: engineering
+    Description: Cost center for billing allocation and chargeback
+
+  Owner:
+    Type: String
+    Default: DevTeam
+    Description: Team or person responsible for this resource
+
+  Project:
+    Type: String
+    Default: litellm-proxy
+    Description: Project identifier for cost tracking and resource organization
+
+  Compliance:
+    Type: String
+    Default: None
+    AllowedValues:
+      - None
+      - HIPAA
+      - PCI
+      - SOC2
+      - GDPR
+    Description: Compliance classification for this environment
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+  EnableScaling: !Equals [!Ref EnableAutoScaling, 'true']
+
+Resources:
+  #############################################################################
+  # ECS Cluster
+  # Note: ECR Repository is created separately (deploy-litellm workflow
+  # creates it on first run if needed)
+  #############################################################################
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${Environment}-litellm-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !If [IsProd, 'enabled', 'disabled']
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !If [IsProd, 'FARGATE', 'FARGATE_SPOT']
+          Weight: 1
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+############################################################################
+  # CloudWatch Log Group
+  #############################################################################
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${Environment}-litellm-proxy'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+############################################################################
+  # ECS Task Definition
+  #############################################################################
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${Environment}-litellm-proxy'
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${Environment}-litellm-ecs-execution-role-arn'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${Environment}-litellm-ecs-task-role-arn'
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: litellm-proxy
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 4000
+              Protocol: tcp
+          Environment:
+            - Name: LITELLM_LOG
+              Value: DEBUG
+            - Name: STORE_MODEL_IN_DB
+              Value: 'true'
+            - Name: LITELLM_MODE
+              Value: PRODUCTION
+            - Name: UI_ACCESS_MODE
+              Value: admin_ui
+          Secrets:
+            - Name: LITELLM_MASTER_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:LITELLM_MASTER_KEY::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: '${Environment}-litellm-master-key-arn'
+            - Name: UI_USERNAME
+              ValueFrom: !Sub
+                - '${SecretArn}:UI_USERNAME::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: '${Environment}-litellm-master-key-arn'
+            - Name: UI_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:UI_PASSWORD::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: '${Environment}-litellm-master-key-arn'
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:OPENAI_API_KEY::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: '${Environment}-litellm-api-keys-arn'
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub
+                - '${SecretArn}:ANTHROPIC_API_KEY::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: '${Environment}-litellm-api-keys-arn'
+            - Name: DATABASE_URL
+              ValueFrom: !Sub
+                - '${SecretArn}:DATABASE_URL::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: '${Environment}-litellm-database-secret-arn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: litellm
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - python -c "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=5)" || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 5
+            StartPeriod: 180
+          LinuxParameters:
+            InitProcessEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-task'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+############################################################################
+  # Target Group
+  #############################################################################
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Environment}-litellm-tg'
+      VpcId: !ImportValue
+        Fn::Sub: '${Environment}-litellm-vpc-id'
+      Protocol: HTTP
+      Port: 4000
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /health/liveliness
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-tg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+############################################################################
+  # ALB Listener Rules
+  #############################################################################
+  ListenerRuleV1:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !ImportValue
+        Fn::Sub: '${Environment}-litellm-http-listener-arn'
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/v1/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  ListenerRuleHealth:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !ImportValue
+        Fn::Sub: '${Environment}-litellm-http-listener-arn'
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/health/*'
+              - '/health'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  ListenerRuleUI:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !ImportValue
+        Fn::Sub: '${Environment}-litellm-http-listener-arn'
+      Priority: 30
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/ui/*'
+              - '/ui'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # Catch-all rule for everything else (static assets, admin API, docs)
+  # Must be lowest priority (highest number)
+  ListenerRuleCatchAll:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !ImportValue
+        Fn::Sub: '${Environment}-litellm-http-listener-arn'
+      Priority: 100
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  #############################################################################
+  # ECS Service
+  #############################################################################
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ListenerRuleV1
+      - ListenerRuleHealth
+      - ListenerRuleUI
+      - ListenerRuleCatchAll
+    Properties:
+      ServiceName: !Sub '${Environment}-litellm-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${Environment}-litellm-ecs-sg-id'
+          Subnets:
+            - !ImportValue
+              Fn::Sub: '${Environment}-litellm-private-subnet-1-id'
+            - !ImportValue
+              Fn::Sub: '${Environment}-litellm-private-subnet-2-id'
+      LoadBalancers:
+        - ContainerName: litellm-proxy
+          ContainerPort: 4000
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: !Ref HealthCheckGracePeriod
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+############################################################################
+  # Auto Scaling
+  #############################################################################
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: EnableScaling
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref MinCapacity
+      MaxCapacity: !Ref MaxCapacity
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+
+  ScalingPolicyCPU:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: EnableScaling
+    Properties:
+      PolicyName: !Sub '${Environment}-litellm-cpu-scaling'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  ScalingPolicyMemory:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: EnableScaling
+    Properties:
+      PolicyName: !Sub '${Environment}-litellm-memory-scaling'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        TargetValue: 80
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  #############################################################################
+  # CloudWatch Alarms
+  #############################################################################
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-litellm-high-cpu'
+      AlarmDescription: ECS task CPU utilization is high
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      TreatMissingData: notBreaching
+
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-litellm-high-memory'
+      AlarmDescription: ECS task memory utilization is high
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      TreatMissingData: notBreaching
+
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-litellm-unhealthy-hosts'
+      AlarmDescription: Target group has unhealthy hosts
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !Select
+            - 1
+            - !Split
+              - 'loadbalancer/'
+              - !ImportValue
+                Fn::Sub: '${Environment}-litellm-alb-arn'
+      TreatMissingData: notBreaching
+
+  Target5xxErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-litellm-5xx-errors'
+      AlarmDescription: High rate of 5xx errors from target
+      MetricName: HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !Select
+            - 1
+            - !Split
+              - 'loadbalancer/'
+              - !ImportValue
+                Fn::Sub: '${Environment}-litellm-alb-arn'
+      TreatMissingData: notBreaching
+
+#############################################################################
+# Outputs
+#############################################################################
+Outputs:
+  ECSClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${Environment}-litellm-cluster-name'
+
+  ECSClusterArn:
+    Description: ECS Cluster ARN
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${Environment}-litellm-cluster-arn'
+
+  ECSServiceName:
+    Description: ECS Service Name
+    Value: !GetAtt ECSService.Name
+    Export:
+      Name: !Sub '${Environment}-litellm-service-name'
+
+  ECSServiceArn:
+    Description: ECS Service ARN
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub '${Environment}-litellm-service-arn'
+
+  TargetGroupArn:
+    Description: Target Group ARN
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub '${Environment}-litellm-tg-arn'
+
+  ECRRepositoryUri:
+    Description: ECR Repository URI
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/litellm-proxy'
+    Export:
+      Name: !Sub '${Environment}-litellm-ecr-uri'
+
+  LogGroupName:
+    Description: CloudWatch Log Group Name
+    Value: !Ref LogGroup
+    Export:
+      Name: !Sub '${Environment}-litellm-log-group'
+
+  LoadBalancerURL:
+    Description: URL to access LiteLLM
+    Value: !ImportValue
+      Fn::Sub: '${Environment}-litellm-url'
+
+  HealthCheckURL:
+    Description: Health check URL
+    Value: !Sub
+      - '${URL}/health/liveliness'
+      - URL: !ImportValue
+          Fn::Sub: '${Environment}-litellm-url'
+
+  APIEndpoint:
+    Description: API endpoint URL
+    Value: !Sub
+      - '${URL}/v1/chat/completions'
+      - URL: !ImportValue
+          Fn::Sub: '${Environment}-litellm-url'
+
+  GetMasterKeyCommand:
+    Description: Command to get the master key
+    Value: !Sub |
+      aws secretsmanager get-secret-value --secret-id ${Environment}/litellm/master-key --query 'SecretString' --output text | jq -r '.LITELLM_MASTER_KEY'
+
+  TestCurlCommand:
+    Description: Example curl command to test the API
+    Value: !Sub
+      - |
+        MASTER_KEY=$(aws secretsmanager get-secret-value --secret-id ${Environment}/litellm/master-key --query 'SecretString' --output text | jq -r '.LITELLM_MASTER_KEY')
+        curl -X POST "${URL}/v1/chat/completions" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $MASTER_KEY" \
+          -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}'
+      - URL: !ImportValue
+          Fn::Sub: '${Environment}-litellm-url'

@@ -1,0 +1,529 @@
+# Azure Pipeline: Teardown Infrastructure
+# Deletes CloudFormation stacks in reverse dependency order
+# Trigger: Manual only with explicit confirmation
+
+trigger: none
+
+parameters:
+- name: environment
+  displayName: 'Environment to teardown'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: stack
+  displayName: 'Stack to teardown (or all)'
+  type: string
+  default: 'litellm'
+  values:
+  - litellm
+  - database
+  - alb
+  - network
+  - security
+  - all
+
+- name: confirmDelete
+  displayName: 'Type "DELETE" to confirm'
+  type: string
+  default: ''
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+variables:
+- group: litellm-aws-config
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: Validate
+  displayName: 'Validate Teardown Request'
+  jobs:
+  - job: ValidateConfirmation
+    displayName: 'Validate DELETE Confirmation'
+    steps:
+    - checkout: none
+
+    - bash: |
+        if [ "${{ parameters.confirmDelete }}" != "DELETE" ]; then
+          echo "##vso[task.logissue type=error]You must type 'DELETE' to confirm teardown"
+          echo "##vso[task.complete result=Failed;]Confirmation failed"
+          exit 1
+        fi
+        echo "Confirmation validated: DELETE"
+      displayName: 'Validate confirmation'
+
+    - bash: |
+        if [ "${{ parameters.environment }}" = "prod" ]; then
+          echo "##vso[task.logissue type=warning]You are about to teardown PRODUCTION infrastructure!"
+          echo "##vso[task.logissue type=warning]This action is IRREVERSIBLE for some resources."
+        fi
+      displayName: 'Warn about production'
+      condition: eq('${{ parameters.environment }}', 'prod')
+
+- stage: PreTeardownCleanup
+  displayName: 'Pre-Teardown Cleanup'
+  dependsOn: Validate
+  condition: and(succeeded(), eq('${{ parameters.stack }}', 'all'))
+  jobs:
+  - job: CleanupLogGroups
+    displayName: 'Delete CloudWatch Log Groups'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete CloudWatch Log Groups'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "Deleting CloudWatch Log Groups"
+          echo "=========================================="
+          echo "Environment: ${{ parameters.environment }}"
+          echo ""
+
+          # Find all log groups matching the environment
+          LOG_GROUPS=$(aws logs describe-log-groups \
+            --region ${{ parameters.awsRegion }} \
+            --query "logGroups[?contains(logGroupName, '${{ parameters.environment }}-litellm')].logGroupName" \
+            --output text)
+
+          if [ -n "$LOG_GROUPS" ]; then
+            for LOG_GROUP in $LOG_GROUPS; do
+              echo "Deleting log group: $LOG_GROUP"
+              aws logs delete-log-group \
+                --log-group-name $LOG_GROUP \
+                --region ${{ parameters.awsRegion }} || true
+            done
+            echo ""
+            echo "✓ CloudWatch Log Groups deleted"
+          else
+            echo "No CloudWatch Log Groups found matching pattern: ${{ parameters.environment }}-litellm"
+          fi
+          echo ""
+        failOnStderr: false
+
+- stage: TeardownLiteLLM
+  displayName: 'Teardown LiteLLM Stack'
+  dependsOn:
+  - Validate
+  - PreTeardownCleanup
+  condition: and(in(dependencies.PreTeardownCleanup.result, 'Succeeded', 'Skipped'), or(eq('${{ parameters.stack }}', 'litellm'), eq('${{ parameters.stack }}', 'all')))
+  jobs:
+  - job: DeleteLiteLLM
+    displayName: 'Delete LiteLLM Stack'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete LiteLLM Stack'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          STACK_NAME="${{ parameters.environment }}-litellm-stack"
+
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME 2>/dev/null; then
+            echo "Deleting $STACK_NAME..."
+
+            # Scale ECS service to 0 first for faster deletion
+            CLUSTER_NAME=$(aws cloudformation describe-stacks \
+              --stack-name $STACK_NAME \
+              --query "Stacks[0].Outputs[?OutputKey=='ClusterName'].OutputValue" \
+              --output text 2>/dev/null)
+
+            SERVICE_NAME=$(aws cloudformation describe-stacks \
+              --stack-name $STACK_NAME \
+              --query "Stacks[0].Outputs[?OutputKey=='ServiceName'].OutputValue" \
+              --output text 2>/dev/null)
+
+            if [ -n "$CLUSTER_NAME" ] && [ -n "$SERVICE_NAME" ]; then
+              echo "Scaling ECS service to 0..."
+              aws ecs update-service \
+                --cluster $CLUSTER_NAME \
+                --service $SERVICE_NAME \
+                --desired-count 0 \
+                --region ${{ parameters.awsRegion }} >/dev/null 2>&1 || true
+              sleep 10
+            fi
+
+            aws cloudformation delete-stack --stack-name $STACK_NAME
+            echo "Waiting for stack deletion..."
+            aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME
+            echo "✓ $STACK_NAME deleted"
+          else
+            echo "Stack $STACK_NAME does not exist, skipping"
+          fi
+        failOnStderr: false
+
+    - task: AWSShellScript@1
+      displayName: 'Cleanup LiteLLM CloudWatch Log Groups'
+      condition: eq('${{ parameters.stack }}', 'litellm')
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "Cleaning up CloudWatch Log Groups for LiteLLM stack..."
+
+          # Delete ECS Container Insights log group
+          LOG_GROUP="/aws/ecs/containerinsights/${{ parameters.environment }}-litellm-cluster/performance"
+          if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --region ${{ parameters.awsRegion }} 2>/dev/null | grep -q "$LOG_GROUP"; then
+            echo "Deleting log group: $LOG_GROUP"
+            aws logs delete-log-group --log-group-name "$LOG_GROUP" --region ${{ parameters.awsRegion }} || true
+            echo "✓ Log group deleted"
+          else
+            echo "Log group not found: $LOG_GROUP"
+          fi
+        failOnStderr: false
+
+- stage: TeardownDatabase
+  displayName: 'Teardown Database Stack'
+  dependsOn:
+  - Validate
+  - TeardownLiteLLM
+  condition: and(succeeded(), or(eq('${{ parameters.stack }}', 'database'), eq('${{ parameters.stack }}', 'all')))
+  jobs:
+  - job: DeleteDatabase
+    displayName: 'Delete Database Stack'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete Database Stack'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          STACK_NAME="${{ parameters.environment }}-database-stack"
+
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME 2>/dev/null; then
+            echo "Deleting $STACK_NAME..."
+
+            # Disable deletion protection if enabled
+            DB_INSTANCE=$(aws cloudformation describe-stack-resources \
+              --stack-name $STACK_NAME \
+              --query "StackResources[?ResourceType=='AWS::RDS::DBInstance'].PhysicalResourceId" \
+              --output text 2>/dev/null)
+
+            if [ -n "$DB_INSTANCE" ]; then
+              echo "Disabling deletion protection on $DB_INSTANCE..."
+              aws rds modify-db-instance \
+                --db-instance-identifier $DB_INSTANCE \
+                --no-deletion-protection \
+                --apply-immediately \
+                --region ${{ parameters.awsRegion }} >/dev/null 2>&1 || true
+              sleep 5
+            fi
+
+            aws cloudformation delete-stack --stack-name $STACK_NAME
+            echo "Waiting for stack deletion (this may take 10-15 minutes)..."
+            aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME
+            echo "✓ $STACK_NAME deleted"
+          else
+            echo "Stack $STACK_NAME does not exist, skipping"
+          fi
+        failOnStderr: false
+        timeoutInMinutes: 30
+
+- stage: TeardownALB
+  displayName: 'Teardown ALB Stack'
+  dependsOn:
+  - Validate
+  - TeardownLiteLLM
+  - TeardownDatabase
+  condition: and(succeeded(), or(eq('${{ parameters.stack }}', 'alb'), eq('${{ parameters.stack }}', 'all')))
+  jobs:
+  - job: DeleteALB
+    displayName: 'Delete ALB Stack'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete ALB Stack'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          STACK_NAME="${{ parameters.environment }}-alb-stack"
+
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME 2>/dev/null; then
+            echo "Deleting $STACK_NAME..."
+            aws cloudformation delete-stack --stack-name $STACK_NAME
+            echo "Waiting for stack deletion..."
+            aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME
+            echo "✓ $STACK_NAME deleted"
+          else
+            echo "Stack $STACK_NAME does not exist, skipping"
+          fi
+        failOnStderr: false
+
+- stage: TeardownNetwork
+  displayName: 'Teardown Network Stack'
+  dependsOn:
+  - Validate
+  - TeardownLiteLLM
+  - TeardownDatabase
+  - TeardownALB
+  condition: and(succeeded(), or(eq('${{ parameters.stack }}', 'network'), eq('${{ parameters.stack }}', 'all')))
+  jobs:
+  - job: DeleteNetwork
+    displayName: 'Delete Network Stack'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete Network Stack'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          STACK_NAME="${{ parameters.environment }}-network-stack"
+
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME 2>/dev/null; then
+            echo "Deleting $STACK_NAME..."
+            aws cloudformation delete-stack --stack-name $STACK_NAME
+            echo "Waiting for stack deletion..."
+            aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME
+            echo "✓ $STACK_NAME deleted"
+          else
+            echo "Stack $STACK_NAME does not exist, skipping"
+          fi
+        failOnStderr: false
+
+- stage: TeardownSecurity
+  displayName: 'Teardown Security Stack'
+  dependsOn:
+  - Validate
+  - TeardownLiteLLM
+  - TeardownDatabase
+  - TeardownALB
+  - TeardownNetwork
+  condition: and(succeeded(), or(eq('${{ parameters.stack }}', 'security'), eq('${{ parameters.stack }}', 'all')))
+  jobs:
+  - job: DeleteSecurity
+    displayName: 'Delete Security Stack'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete secrets without recovery'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "Force deleting secrets without recovery period..."
+
+          for SECRET in master-key api-keys database; do
+            SECRET_ID="${{ parameters.environment }}/litellm/$SECRET"
+            if aws secretsmanager describe-secret --secret-id $SECRET_ID 2>/dev/null; then
+              echo "Deleting secret: $SECRET_ID"
+              aws secretsmanager delete-secret \
+                --secret-id $SECRET_ID \
+                --force-delete-without-recovery \
+                --region ${{ parameters.awsRegion }} >/dev/null 2>&1 || true
+            fi
+          done
+
+          echo "Waiting for secrets to be deleted..."
+          sleep 10
+        failOnStderr: false
+
+    - task: AWSShellScript@1
+      displayName: 'Delete Security Stack'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          STACK_NAME="${{ parameters.environment }}-security-stack"
+
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME 2>/dev/null; then
+            echo "Deleting $STACK_NAME..."
+            aws cloudformation delete-stack --stack-name $STACK_NAME
+            echo "Waiting for stack deletion..."
+            aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME
+            echo "✓ $STACK_NAME deleted"
+          else
+            echo "Stack $STACK_NAME does not exist, skipping"
+          fi
+        failOnStderr: false
+
+    - task: AWSShellScript@1
+      displayName: 'Cleanup Security Stack CloudWatch Log Groups'
+      condition: eq('${{ parameters.stack }}', 'security')
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "Cleaning up CloudWatch Log Groups for Security stack..."
+
+          # Delete Lambda rotation function log group
+          LOG_GROUP="/aws/lambda/${{ parameters.environment }}-litellm-master-key-rotation"
+          if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --region ${{ parameters.awsRegion }} 2>/dev/null | grep -q "$LOG_GROUP"; then
+            echo "Deleting log group: $LOG_GROUP"
+            aws logs delete-log-group --log-group-name "$LOG_GROUP" --region ${{ parameters.awsRegion }} || true
+            echo "✓ Log group deleted"
+          else
+            echo "Log group not found: $LOG_GROUP"
+          fi
+
+          # Delete database secret update Lambda log group (if exists)
+          LOG_GROUP2="/aws/lambda/${{ parameters.environment }}-litellm-update-db-secret"
+          if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP2" --region ${{ parameters.awsRegion }} 2>/dev/null | grep -q "$LOG_GROUP2"; then
+            echo "Deleting log group: $LOG_GROUP2"
+            aws logs delete-log-group --log-group-name "$LOG_GROUP2" --region ${{ parameters.awsRegion }} || true
+            echo "✓ Log group deleted"
+          else
+            echo "Log group not found: $LOG_GROUP2"
+          fi
+        failOnStderr: false
+
+- stage: Cleanup
+  displayName: 'Additional Cleanup'
+  dependsOn:
+  - TeardownLiteLLM
+  - TeardownDatabase
+  - TeardownALB
+  - TeardownNetwork
+  - TeardownSecurity
+  condition: succeededOrFailed()
+  jobs:
+  - job: CleanupResources
+    displayName: 'Cleanup ECR and Logs'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Delete ECR Repository'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "Deleting ECR Repository"
+          echo "=========================================="
+          echo "Repository: litellm-proxy"
+          echo ""
+
+          ECR_REPO="litellm-proxy"
+
+          # Check if repository exists
+          if aws ecr describe-repositories \
+              --repository-names $ECR_REPO \
+              --region ${{ parameters.awsRegion }} 2>/dev/null; then
+
+            # Count images
+            IMAGE_COUNT=$(aws ecr list-images \
+              --repository-name $ECR_REPO \
+              --region ${{ parameters.awsRegion }} \
+              --query 'length(imageIds)' \
+              --output text 2>/dev/null || echo "0")
+
+            echo "Repository contains $IMAGE_COUNT images"
+
+            # Force delete (removes all images and repository)
+            echo "Deleting repository (including all images)..."
+            aws ecr delete-repository \
+              --repository-name $ECR_REPO \
+              --region ${{ parameters.awsRegion }} \
+              --force || true
+
+            echo "✓ ECR repository deleted"
+          else
+            echo "ECR repository $ECR_REPO does not exist or already deleted"
+          fi
+          echo ""
+        failOnStderr: false
+
+    - task: AWSShellScript@1
+      displayName: 'Display teardown summary'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "Teardown Summary"
+          echo "=========================================="
+          echo "Environment: ${{ parameters.environment }}"
+          echo "Stack(s): ${{ parameters.stack }}"
+          echo ""
+          echo "Deleted stacks:"
+
+          for STACK in litellm database alb network security; do
+            STACK_NAME="${{ parameters.environment }}-${STACK}-stack"
+            if ! aws cloudformation describe-stacks --stack-name $STACK_NAME 2>/dev/null; then
+              echo "  ✓ $STACK_NAME"
+            else
+              echo "  ⚠️  $STACK_NAME (still exists or deletion failed)"
+            fi
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "Teardown completed"
+          echo "=========================================="
+        failOnStderr: false
+
+    - checkout: self
+      displayName: 'Checkout repository for compliance scan'
+      condition: eq('${{ parameters.stack }}', 'all')
+
+    - task: AWSShellScript@1
+      displayName: 'Run Compliance Scan'
+      condition: eq('${{ parameters.stack }}', 'all')
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "Running Post-Teardown Compliance Scan"
+          echo "=========================================="
+          echo ""
+
+          # Make script executable
+          chmod +x scripts/teardown-compliance-scan.sh
+
+          # Run the compliance scan (don't fail pipeline if orphaned resources found)
+          ./scripts/teardown-compliance-scan.sh ${{ parameters.environment }} ${{ parameters.awsRegion }} || true
+
+          echo ""
+          echo "Compliance scan completed"
+          echo ""
+
+          # Show the report file name
+          REPORT_FILE=$(ls -t teardown-compliance-report-*.md 2>/dev/null | head -1)
+          if [ -n "$REPORT_FILE" ]; then
+            echo "Compliance report generated: $REPORT_FILE"
+            echo ""
+            echo "Report summary:"
+            tail -20 "$REPORT_FILE"
+          fi
+        failOnStderr: false
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Upload Compliance Report'
+      condition: eq('${{ parameters.stack }}', 'all')
+      inputs:
+        PathtoPublish: 'teardown-compliance-report-*.md'
+        ArtifactName: 'ComplianceReport'
+        publishLocation: 'Container'
+      continueOnError: true

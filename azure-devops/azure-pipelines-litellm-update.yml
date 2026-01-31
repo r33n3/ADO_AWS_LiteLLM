@@ -1,0 +1,563 @@
+# Azure Pipeline: Restart/Update ECS Service
+# Purpose:
+#   - Update configuration (environment variables) from template changes
+#   - Update LiteLLM container to latest version
+#   - Restart ECS service after IAM/secret changes
+# Trigger: Manual only
+
+trigger: none
+
+parameters:
+- name: environment
+  displayName: 'Environment'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: updateMode
+  displayName: 'Update Mode'
+  type: string
+  default: 'restart'
+  values:
+  - restart
+  - config
+  - image
+
+- name: imageSource
+  displayName: '[If mode=image] Pull image from'
+  type: string
+  default: 'ghcr'
+  values:
+  - ghcr
+  - docker-hub
+
+- name: imageTag
+  displayName: '[If mode=image] LiteLLM version tag'
+  type: string
+  default: 'main-latest'
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+variables:
+- group: litellm-aws-config
+- name: litellmStackName
+  value: '${{ parameters.environment }}-litellm-stack'
+- name: ecrRepository
+  value: 'litellm-proxy'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: UpdateConfig
+  displayName: 'Update Configuration'
+  condition: eq('${{ parameters.updateMode }}', 'config')
+  jobs:
+  - job: UpdateStack
+    displayName: 'Update CloudFormation Stack from Template'
+    steps:
+    - checkout: self
+      displayName: 'Checkout repository for latest template'
+
+    - task: AWSShellScript@1
+      displayName: 'Update Stack with Latest Template (Keep Current Image)'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+
+          STACK_NAME="${{ parameters.environment }}-litellm-stack"
+          TEMPLATE_FILE="infrastructure/litellm-stack.yaml"
+
+          echo "=========================================="
+          echo "Updating Configuration from Template"
+          echo "=========================================="
+          echo "Stack: $STACK_NAME"
+          echo "Template: $TEMPLATE_FILE"
+          echo ""
+
+          # Get current parameters
+          echo "⏳ Retrieving current stack parameters..."
+          CURRENT_PARAMS=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --query 'Stacks[0].Parameters' \
+            --output json)
+
+          # Extract parameter values
+          ENVIRONMENT=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="Environment") | .ParameterValue')
+          CONTAINER_IMAGE=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="ContainerImage") | .ParameterValue')
+          CONTAINER_CPU=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="ContainerCpu") | .ParameterValue')
+          CONTAINER_MEMORY=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="ContainerMemory") | .ParameterValue')
+          DESIRED_COUNT=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="DesiredCount") | .ParameterValue')
+          ENABLE_AUTOSCALING=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="EnableAutoScaling") | .ParameterValue')
+
+          echo "Current Parameters:"
+          echo "  Environment: $ENVIRONMENT"
+          echo "  ContainerImage: $CONTAINER_IMAGE (will not change)"
+          echo "  ContainerCpu: $CONTAINER_CPU"
+          echo "  ContainerMemory: $CONTAINER_MEMORY"
+          echo "  DesiredCount: $DESIRED_COUNT"
+          echo "  EnableAutoScaling: $ENABLE_AUTOSCALING"
+          echo ""
+
+          echo "Configuration changes from template:"
+          echo "  - Environment variables (e.g., UI_ACCESS_MODE)"
+          echo "  - Health check settings"
+          echo "  - Task role permissions"
+          echo "  - Any other template modifications"
+          echo ""
+
+          # Update stack with latest template but keep same image
+          echo "⏳ Updating CloudFormation stack..."
+          UPDATE_OUTPUT=$(aws cloudformation update-stack \
+            --stack-name $STACK_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --template-body file://$TEMPLATE_FILE \
+            --parameters \
+              ParameterKey=Environment,ParameterValue=$ENVIRONMENT \
+              ParameterKey=ContainerImage,ParameterValue=$CONTAINER_IMAGE \
+              ParameterKey=ContainerCpu,ParameterValue=$CONTAINER_CPU \
+              ParameterKey=ContainerMemory,ParameterValue=$CONTAINER_MEMORY \
+              ParameterKey=DesiredCount,ParameterValue=$DESIRED_COUNT \
+              ParameterKey=EnableAutoScaling,ParameterValue=$ENABLE_AUTOSCALING \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --no-cli-pager 2>&1)
+
+          UPDATE_EXIT=$?
+
+          if [ $UPDATE_EXIT -eq 0 ]; then
+            echo ""
+            echo "⏳ Waiting for stack update to complete..."
+            aws cloudformation wait stack-update-complete \
+              --stack-name $STACK_NAME \
+              --region ${{ parameters.awsRegion }}
+
+            echo ""
+            echo "✓ Configuration update complete"
+            echo "✓ ECS service automatically restarted with new configuration"
+          else
+            # Check if the error is "No updates to perform" (not really an error)
+            if echo "$UPDATE_OUTPUT" | grep -q "No updates are to be performed"; then
+              echo ""
+              echo "ℹ️  No configuration changes detected in template"
+              echo "✓ Stack is already up to date"
+              exit 0
+            else
+              echo "❌ Update failed with error:"
+              echo "$UPDATE_OUTPUT"
+              exit 1
+            fi
+          fi
+
+          echo ""
+
+- stage: UpdateImage
+  displayName: 'Update Container Image'
+  condition: eq('${{ parameters.updateMode }}', 'image')
+  jobs:
+  - job: PullAndPush
+    displayName: 'Pull from Registry and Push to ECR'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Pull Latest LiteLLM Image and Push to ECR'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+
+          echo "=========================================="
+          echo "Updating LiteLLM Container Image"
+          echo "=========================================="
+          echo "Environment: ${{ parameters.environment }}"
+          echo "Image Source: ${{ parameters.imageSource }}"
+          echo "Image Tag: ${{ parameters.imageTag }}"
+          echo ""
+
+          # Determine source image
+          if [ "${{ parameters.imageSource }}" = "ghcr" ]; then
+            SOURCE_IMAGE="ghcr.io/berriai/litellm:${{ parameters.imageTag }}"
+          else
+            SOURCE_IMAGE="litellm/litellm:${{ parameters.imageTag }}"
+          fi
+
+          echo "Source Image: $SOURCE_IMAGE"
+          echo ""
+
+          # Pull latest image
+          echo "⏳ Pulling image from registry..."
+          docker pull $SOURCE_IMAGE
+
+          # Get image digest for traceability
+          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $SOURCE_IMAGE | cut -d'@' -f2 | cut -c1-12)
+          echo "✓ Image pulled successfully"
+          echo "Image Digest: $IMAGE_DIGEST"
+          echo ""
+
+          # Get AWS account ID
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.${{ parameters.awsRegion }}.amazonaws.com"
+          ECR_REPO="$ECR_REGISTRY/$(ecrRepository)"
+
+          echo "ECR Repository: $ECR_REPO"
+          echo ""
+
+          # Login to ECR
+          echo "⏳ Logging into Amazon ECR..."
+          aws ecr get-login-password --region ${{ parameters.awsRegion }} | \
+            docker login --username AWS --password-stdin $ECR_REGISTRY
+          echo "✓ Logged into ECR"
+          echo ""
+
+          # Generate timestamp tag for traceability
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          NEW_TAG="$TIMESTAMP-${{ parameters.imageTag }}"
+
+          echo "New ECR Tags:"
+          echo "  - $NEW_TAG (timestamped)"
+          echo "  - latest"
+          echo ""
+
+          # Tag image for ECR
+          docker tag $SOURCE_IMAGE $ECR_REPO:$NEW_TAG
+          docker tag $SOURCE_IMAGE $ECR_REPO:latest
+
+          # Push to ECR
+          echo "⏳ Pushing images to ECR..."
+          docker push $ECR_REPO:$NEW_TAG
+          docker push $ECR_REPO:latest
+          echo "✓ Images pushed to ECR"
+          echo ""
+
+          # Save image URI for CloudFormation update
+          IMAGE_URI="$ECR_REPO:$NEW_TAG"
+          echo "Image URI: $IMAGE_URI"
+          echo "##vso[task.setvariable variable=imageUri;isOutput=true]$IMAGE_URI"
+
+          echo ""
+          echo "=========================================="
+          echo "Image Update Summary"
+          echo "=========================================="
+          echo "Source: $SOURCE_IMAGE"
+          echo "Destination: $ECR_REPO"
+          echo "Tags: $NEW_TAG, latest"
+          echo "=========================================="
+      name: pushImage
+
+    - task: AWSShellScript@1
+      displayName: 'Update CloudFormation Stack with New Image'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+
+          IMAGE_URI="$(pushImage.imageUri)"
+          STACK_NAME="$(litellmStackName)"
+
+          echo "=========================================="
+          echo "Updating CloudFormation Stack"
+          echo "=========================================="
+          echo "Stack: $STACK_NAME"
+          echo "New Image: $IMAGE_URI"
+          echo ""
+
+          # Get current stack parameters
+          echo "⏳ Retrieving current stack parameters..."
+          CURRENT_PARAMS=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --query 'Stacks[0].Parameters' \
+            --output json)
+
+          # Extract individual parameter values
+          ENVIRONMENT=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="Environment") | .ParameterValue')
+          CONTAINER_CPU=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="ContainerCpu") | .ParameterValue')
+          CONTAINER_MEMORY=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="ContainerMemory") | .ParameterValue')
+          DESIRED_COUNT=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="DesiredCount") | .ParameterValue')
+          ENABLE_AUTOSCALING=$(echo $CURRENT_PARAMS | jq -r '.[] | select(.ParameterKey=="EnableAutoScaling") | .ParameterValue')
+
+          echo "Current Parameters:"
+          echo "  Environment: $ENVIRONMENT"
+          echo "  ContainerCpu: $CONTAINER_CPU"
+          echo "  ContainerMemory: $CONTAINER_MEMORY"
+          echo "  DesiredCount: $DESIRED_COUNT"
+          echo "  EnableAutoScaling: $ENABLE_AUTOSCALING"
+          echo ""
+
+          # Update stack with new image
+          echo "⏳ Updating CloudFormation stack..."
+          aws cloudformation update-stack \
+            --stack-name $STACK_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --use-previous-template \
+            --parameters \
+              ParameterKey=Environment,ParameterValue=$ENVIRONMENT \
+              ParameterKey=ContainerImage,ParameterValue=$IMAGE_URI \
+              ParameterKey=ContainerCpu,ParameterValue=$CONTAINER_CPU \
+              ParameterKey=ContainerMemory,ParameterValue=$CONTAINER_MEMORY \
+              ParameterKey=DesiredCount,ParameterValue=$DESIRED_COUNT \
+              ParameterKey=EnableAutoScaling,ParameterValue=$ENABLE_AUTOSCALING \
+            --capabilities CAPABILITY_IAM \
+            --no-cli-pager
+
+          echo ""
+          echo "⏳ Waiting for stack update to complete (this may take 5-10 minutes)..."
+          aws cloudformation wait stack-update-complete \
+            --stack-name $STACK_NAME \
+            --region ${{ parameters.awsRegion }}
+
+          echo ""
+          echo "✓ Stack update complete"
+          echo "✓ ECS service automatically updated with new container image"
+          echo ""
+
+- stage: RestartService
+  displayName: 'Restart ECS Service'
+  condition: eq('${{ parameters.updateMode }}', 'restart')
+  jobs:
+  - job: ForceNewDeployment
+    displayName: 'Force New ECS Deployment'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Get ECS Cluster and Service Names'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "Retrieving ECS Configuration"
+          echo "=========================================="
+          echo "Environment: ${{ parameters.environment }}"
+          echo "Stack: $(litellmStackName)"
+          echo ""
+
+          # Get cluster name
+          CLUSTER_NAME=$(aws cloudformation describe-stacks \
+            --stack-name $(litellmStackName) \
+            --region ${{ parameters.awsRegion }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ECSClusterName'].OutputValue" \
+            --output text)
+
+          # Get service name
+          SERVICE_NAME=$(aws cloudformation describe-stacks \
+            --stack-name $(litellmStackName) \
+            --region ${{ parameters.awsRegion }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ECSServiceName'].OutputValue" \
+            --output text)
+
+          # Validate outputs
+          if [ -z "$CLUSTER_NAME" ] || [ -z "$SERVICE_NAME" ]; then
+            echo "❌ ERROR: Failed to retrieve cluster or service name"
+            echo "Cluster: $CLUSTER_NAME"
+            echo "Service: $SERVICE_NAME"
+            exit 1
+          fi
+
+          echo "✓ Cluster: $CLUSTER_NAME"
+          echo "✓ Service: $SERVICE_NAME"
+          echo ""
+
+          # Save to pipeline variables for next step
+          echo "##vso[task.setvariable variable=clusterName;isOutput=true]$CLUSTER_NAME"
+          echo "##vso[task.setvariable variable=serviceName;isOutput=true]$SERVICE_NAME"
+      name: getConfig
+
+    - task: AWSShellScript@1
+      displayName: 'Force New ECS Deployment'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          CLUSTER_NAME="$(getConfig.clusterName)"
+          SERVICE_NAME="$(getConfig.serviceName)"
+
+          echo "=========================================="
+          echo "Forcing New ECS Deployment"
+          echo "=========================================="
+          echo "Cluster: $CLUSTER_NAME"
+          echo "Service: $SERVICE_NAME"
+          echo ""
+
+          # Check current service status
+          echo "Current service status:"
+          aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --query 'services[0].[serviceName,status,runningCount,desiredCount,deployments[0].rolloutState]' \
+            --output table
+
+          echo ""
+          echo "⏳ Initiating service restart..."
+
+          # Force new deployment
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
+            --force-new-deployment \
+            --region ${{ parameters.awsRegion }} \
+            --no-cli-pager
+
+          echo ""
+          echo "✓ New deployment initiated"
+          echo ""
+          echo "⏳ Waiting for service to stabilize (this may take 2-3 minutes)..."
+
+          # Wait for service to become stable
+          aws ecs wait services-stable \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ parameters.awsRegion }}
+
+          echo ""
+          echo "✓ Service deployment complete"
+          echo ""
+
+          # Show final service status
+          echo "Final service status:"
+          aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --query 'services[0].[serviceName,status,runningCount,desiredCount,deployments[0].rolloutState]' \
+            --output table
+
+          echo ""
+          echo "=========================================="
+          echo "Tasks Status"
+          echo "=========================================="
+
+          # List tasks
+          TASK_ARN=$(aws ecs list-tasks \
+            --cluster $CLUSTER_NAME \
+            --service-name $SERVICE_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --query 'taskArns[0]' \
+            --output text)
+
+          if [ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ]; then
+            echo "Task ARN: $TASK_ARN"
+            echo ""
+
+            # Get task details
+            aws ecs describe-tasks \
+              --cluster $CLUSTER_NAME \
+              --tasks $TASK_ARN \
+              --region ${{ parameters.awsRegion }} \
+              --query 'tasks[0].[taskArn,lastStatus,healthStatus,containers[0].lastStatus]' \
+              --output table
+          else
+            echo "⚠️  No tasks found"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Next Steps"
+          echo "=========================================="
+          echo "1. Check CloudWatch Logs:"
+          echo "   aws logs tail /ecs/${{ parameters.environment }}-litellm-proxy --follow --region ${{ parameters.awsRegion }}"
+          echo ""
+          echo "2. Test API endpoint:"
+          echo "   curl http://\$(ALB_DNS)/health/liveliness"
+          echo ""
+          echo "=========================================="
+
+- stage: VerifyDeployment
+  displayName: 'Verify Deployment'
+  dependsOn:
+  - UpdateConfig
+  - UpdateImage
+  - RestartService
+  condition: or(succeeded('UpdateConfig'), succeeded('UpdateImage'), succeeded('RestartService'))
+  jobs:
+  - job: HealthCheck
+    displayName: 'Verify Service Health'
+    steps:
+    - checkout: none
+
+    - task: AWSShellScript@1
+      displayName: 'Check Service Health and Container Version'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "Deployment Verification"
+          echo "=========================================="
+          echo ""
+
+          # Get ECS cluster and service
+          CLUSTER_NAME=$(aws cloudformation describe-stacks \
+            --stack-name $(litellmStackName) \
+            --region ${{ parameters.awsRegion }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ECSClusterName'].OutputValue" \
+            --output text)
+
+          SERVICE_NAME=$(aws cloudformation describe-stacks \
+            --stack-name $(litellmStackName) \
+            --region ${{ parameters.awsRegion }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ECSServiceName'].OutputValue" \
+            --output text)
+
+          # Get current task definition and image
+          TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          CURRENT_IMAGE=$(aws ecs describe-task-definition \
+            --task-definition $TASK_DEF_ARN \
+            --region ${{ parameters.awsRegion }} \
+            --query 'taskDefinition.containerDefinitions[0].image' \
+            --output text)
+
+          echo "Current Task Definition: $TASK_DEF_ARN"
+          echo "Current Container Image: $CURRENT_IMAGE"
+          echo ""
+
+          # Check service health
+          RUNNING_COUNT=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --query 'services[0].runningCount' \
+            --output text)
+
+          DESIRED_COUNT=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --region ${{ parameters.awsRegion }} \
+            --query 'services[0].desiredCount' \
+            --output text)
+
+          if [ "$RUNNING_COUNT" = "$DESIRED_COUNT" ]; then
+            echo "✓ Service Health: HEALTHY ($RUNNING_COUNT/$DESIRED_COUNT tasks running)"
+          else
+            echo "⚠️  Service Health: UNHEALTHY ($RUNNING_COUNT/$DESIRED_COUNT tasks running)"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Deployment Complete"
+          echo "=========================================="

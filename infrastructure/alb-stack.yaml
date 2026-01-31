@@ -1,0 +1,438 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  LiteLLM ALB Stack - Application Load Balancer, HTTPS Listener, ACM Certificate
+  Owner: Platform Team
+  Deploy Order: 3 (after network-stack)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Domain name for HTTPS certificate (leave empty for HTTP only)
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route53 Hosted Zone ID (required if DomainName is set)
+
+  EnableWAF:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable AWS WAF for rate limiting and protection
+
+  WAFRateLimitPerIP:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    MaxValue: 20000
+    Description: Maximum requests per 5 minutes per IP address
+
+
+  CostCenter:
+    Type: String
+    Default: engineering
+    Description: Cost center for billing allocation and chargeback
+
+  Owner:
+    Type: String
+    Default: DevTeam
+    Description: Team or person responsible for this resource
+
+  Project:
+    Type: String
+    Default: litellm-proxy
+    Description: Project identifier for cost tracking and resource organization
+
+  Compliance:
+    Type: String
+    Default: None
+    AllowedValues:
+      - None
+      - HIPAA
+      - PCI
+      - SOC2
+      - GDPR
+    Description: Compliance classification for this environment
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+  HasDomain: !Not [!Equals [!Ref DomainName, '']]
+  NoDomain: !Equals [!Ref DomainName, '']
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, '']]
+  CreateDNSRecord: !And [!Condition HasDomain, !Condition HasHostedZone]
+  EnableWAFProtection: !Equals [!Ref EnableWAF, 'true']
+
+Resources:
+  #############################################################################
+  # ACM Certificate (if domain provided)
+  #############################################################################
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasDomain
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub '*.${DomainName}'
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !If [HasHostedZone, !Ref HostedZoneId, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-cert'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #############################################################################
+  # Application Load Balancer
+  #############################################################################
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${Environment}-litellm-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !ImportValue
+          Fn::Sub: '${Environment}-litellm-public-subnet-1-id'
+        - !ImportValue
+          Fn::Sub: '${Environment}-litellm-public-subnet-2-id'
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: '${Environment}-litellm-alb-sg-id'
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '120'
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: deletion_protection.enabled
+          Value: !If [IsProd, 'true', 'false']
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-alb'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+
+  #############################################################################
+  # HTTP Listener - Redirect to HTTPS (when domain configured)
+  #############################################################################
+  HTTPListenerRedirect:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasDomain
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Host: '#{host}'
+            Path: '/#{path}'
+            Port: '443'
+            Protocol: HTTPS
+            Query: '#{query}'
+            StatusCode: HTTP_301
+
+  #############################################################################
+  # HTTP Listener - Fixed response (when no domain, HTTP only mode)
+  #############################################################################
+  HTTPListenerNoDomain:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: NoDomain
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            ContentType: text/plain
+            MessageBody: 'LiteLLM API - Healthy'
+            StatusCode: '200'
+
+  #############################################################################
+  # HTTPS Listener
+  #############################################################################
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasDomain
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            ContentType: application/json
+            MessageBody: '{"error": "Not Found", "message": "Use /v1/ for API endpoints"}'
+            StatusCode: '404'
+
+  #############################################################################
+  # Default Target Group (placeholder for listener rules)
+  #############################################################################
+  DefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Environment}-litellm-default-tg'
+      VpcId: !ImportValue
+        Fn::Sub: '${Environment}-litellm-vpc-id'
+      Protocol: HTTP
+      Port: 4000
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /health/liveliness
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-default-tg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #############################################################################
+  # Route53 DNS Record
+  #############################################################################
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateDNSRecord
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+  #############################################################################
+  # WAF WebACL (optional)
+  #############################################################################
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: EnableWAFProtection
+    Properties:
+      Name: !Sub '${Environment}-litellm-waf'
+      Scope: REGIONAL
+      Description: WAF protection for LiteLLM API
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${Environment}LiteLLMWAF'
+      Rules:
+        # Rate limiting per IP
+        - Name: RateLimitPerIP
+          Priority: 1
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref WAFRateLimitPerIP
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIP
+
+        # AWS Managed Rules - Common Rule Set
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                - Name: SizeRestrictions_BODY
+                - Name: GenericRFI_BODY
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+
+        # AWS Managed Rules - Known Bad Inputs
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+
+        # AWS Managed Rules - SQL Injection
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 4
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesSQLiRuleSet
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-waf'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WAFWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: EnableWAFProtection
+    Properties:
+      ResourceArn: !Ref ApplicationLoadBalancer
+      WebACLArn: !GetAtt WAFWebACL.Arn
+
+#############################################################################
+# Outputs - Used by other stacks
+#############################################################################
+Outputs:
+  LoadBalancerArn:
+    Description: ARN of the Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${Environment}-litellm-alb-arn'
+
+  LoadBalancerDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${Environment}-litellm-alb-dns'
+
+  LoadBalancerHostedZoneId:
+    Description: Hosted Zone ID of the ALB (for Route53 alias records)
+    Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+    Export:
+      Name: !Sub '${Environment}-litellm-alb-zone-id'
+
+  HTTPListenerArn:
+    Description: ARN of the HTTP Listener
+    Value: !If
+      - HasDomain
+      - !Ref HTTPListenerRedirect
+      - !Ref HTTPListenerNoDomain
+    Export:
+      Name: !Sub '${Environment}-litellm-http-listener-arn'
+
+  HTTPSListenerArn:
+    Description: ARN of the HTTPS Listener
+    Condition: HasDomain
+    Value: !Ref HTTPSListener
+    Export:
+      Name: !Sub '${Environment}-litellm-https-listener-arn'
+
+  DefaultTargetGroupArn:
+    Description: ARN of the default Target Group
+    Value: !Ref DefaultTargetGroup
+    Export:
+      Name: !Sub '${Environment}-litellm-default-tg-arn'
+
+  CertificateArn:
+    Description: ARN of the ACM Certificate
+    Condition: HasDomain
+    Value: !Ref Certificate
+    Export:
+      Name: !Sub '${Environment}-litellm-cert-arn'
+
+  LoadBalancerURL:
+    Description: URL to access the load balancer
+    Value: !If
+      - HasDomain
+      - !Sub 'https://${DomainName}'
+      - !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${Environment}-litellm-url'
+
+  WAFWebACLArn:
+    Description: ARN of the WAF WebACL
+    Condition: EnableWAFProtection
+    Value: !GetAtt WAFWebACL.Arn
+    Export:
+      Name: !Sub '${Environment}-litellm-waf-arn'

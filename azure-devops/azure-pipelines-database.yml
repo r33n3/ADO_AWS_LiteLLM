@@ -1,0 +1,277 @@
+# Azure Pipeline: Deploy Database Stack
+# Deploys RDS PostgreSQL with automatic backups, encryption, and secret rotation
+# Trigger: Manual only (platform team responsibility)
+#
+# ⚠️ PREREQUISITES BEFORE RUNNING THIS PIPELINE:
+#
+# 1. AWS Service Connection:
+#    - Name: 'aws-litellm-connection'
+#    - Type: AWS
+#    - Authentication: Access Key
+#    - Setup: See docs/SETUP-AZURE-DEVOPS-DETAILED.md
+#
+# 2. Variable Group: 'litellm-aws-config'
+#    Required variables:
+#    - AWS_ACCOUNT_ID: Your AWS account ID
+#    - AWS_REGION: AWS region (default: us-east-1)
+#
+# 3. Security and Network Stacks:
+#    - Deploy 'security-stack' first (azure-pipelines-security.yml)
+#    - Deploy 'network-stack' second (azure-pipelines-network.yml)
+#
+# 4. Database Credentials:
+#    - Master password is AUTO-GENERATED and stored in AWS Secrets Manager
+#    - Secret name: {environment}/litellm/database
+#    - Retrieve password after deployment:
+#      aws secretsmanager get-secret-value --secret-id dev/litellm/database --query SecretString --output text
+#
+
+trigger: none
+
+parameters:
+- name: environment
+  displayName: 'Environment to deploy to'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+
+- name: dbInstanceClass
+  displayName: 'RDS instance type'
+  type: string
+  default: 'db.t3.micro'
+  values:
+  - db.t3.micro
+  - db.t3.small
+  - db.t3.medium
+  - db.t3.large
+  - db.r6g.large
+  - db.r6g.xlarge
+
+- name: allocatedStorage
+  displayName: 'Initial storage (GB)'
+  type: number
+  default: 20
+
+- name: maxStorage
+  displayName: 'Max storage with auto-scaling (GB)'
+  type: number
+  default: 100
+
+- name: enableMultiAz
+  displayName: 'Enable Multi-AZ (high availability)'
+  type: string
+  default: 'false'
+  values:
+  - 'true'
+  - 'false'
+
+- name: backupRetentionDays
+  displayName: 'Backup retention (days)'
+  type: number
+  default: 7
+
+- name: enableDeletionProtection
+  displayName: 'Enable deletion protection'
+  type: string
+  default: 'false'
+  values:
+  - 'true'
+  - 'false'
+
+- name: enableSecretRotation
+  displayName: 'Enable automatic secret rotation'
+  type: string
+  default: 'false'
+  values:
+  - 'true'
+  - 'false'
+
+- name: awsRegion
+  displayName: 'AWS Region'
+  type: string
+  default: 'us-east-1'
+
+
+- name: costCenter
+  displayName: 'Cost Center'
+  type: string
+  default: 'engineering'
+
+- name: owner
+  displayName: 'Owner (team or email)'
+  type: string
+  default: 'DevTeam'
+
+- name: project
+  displayName: 'Project Name'
+  type: string
+  default: 'litellm-proxy'
+
+- name: compliance
+  displayName: 'Compliance Classification'
+  type: string
+  default: 'None'
+  values:
+  - None
+  - HIPAA
+  - PCI
+  - SOC2
+  - GDPR
+
+variables:
+- group: litellm-aws-config
+- name: stackName
+  value: '${{ parameters.environment }}-database-stack'
+- name: templateFile
+  value: 'infrastructure/database-stack.yaml'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: VerifyPrerequisites
+  displayName: 'Verify Prerequisites'
+  jobs:
+  - job: CheckStacks
+    displayName: 'Check Required Stacks Exist'
+    steps:
+    - checkout: none
+
+    - template: templates/check-prerequisites.yml
+      parameters:
+        requiredStacks:
+          - '${{ parameters.environment }}-security-stack'
+          - '${{ parameters.environment }}-network-stack'
+        awsRegion: '${{ parameters.awsRegion }}'
+        awsServiceConnection: 'aws-litellm-connection'
+
+- stage: DeployDatabaseStack
+  displayName: 'Deploy Database Stack'
+  dependsOn: VerifyPrerequisites
+  condition: succeeded()
+  jobs:
+  - job: Deploy
+    displayName: 'Deploy RDS PostgreSQL'
+    steps:
+    - checkout: self
+      displayName: 'Checkout repository'
+
+    - template: templates/aws-cfn-deploy.yml
+      parameters:
+        stackName: '$(stackName)'
+        templateFile: '$(templateFile)'
+        parameters: 'Environment=${{ parameters.environment }} DBInstanceClass=${{ parameters.dbInstanceClass }} DBAllocatedStorage=${{ parameters.allocatedStorage }} DBMaxAllocatedStorage=${{ parameters.maxStorage }} EnableMultiAZ=${{ parameters.enableMultiAz }} BackupRetentionDays=${{ parameters.backupRetentionDays }} EnableDeletionProtection=${{ parameters.enableDeletionProtection }} EnableSecretRotation=${{ parameters.enableSecretRotation }}'
+        capabilities: 'CAPABILITY_IAM CAPABILITY_NAMED_IAM'
+        awsRegion: '${{ parameters.awsRegion }}'
+        awsServiceConnection: 'aws-litellm-connection'
+        tags: 'Environment=${{ parameters.environment }} Application=litellm ManagedBy=CloudFormation Owner=PlatformTeam'
+
+    - task: AWSShellScript@1
+      displayName: 'Get Stack Outputs and Display Summary'
+      inputs:
+        awsCredentials: 'aws-litellm-connection'
+        regionName: '${{ parameters.awsRegion }}'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "=========================================="
+          echo "Database Stack Deployed Successfully"
+          echo "=========================================="
+          echo ""
+          echo "Environment: ${{ parameters.environment }}"
+          echo "Instance Class: ${{ parameters.dbInstanceClass }}"
+          echo "Storage: ${{ parameters.allocatedStorage }}GB (auto-scale to ${{ parameters.maxStorage }}GB)"
+          echo "Multi-AZ: ${{ parameters.enableMultiAz }}"
+          echo "Backup Retention: ${{ parameters.backupRetentionDays }} days"
+          echo "Deletion Protection: ${{ parameters.enableDeletionProtection }}"
+          echo ""
+
+          STACK_NAME="$(stackName)"
+
+          # Get RDS Endpoint
+          DB_ENDPOINT=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='DatabaseEndpoint'].OutputValue" \
+            --output text)
+          echo "Database Endpoint: $DB_ENDPOINT"
+
+          # Get RDS Port
+          DB_PORT=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='DatabasePort'].OutputValue" \
+            --output text)
+          echo "Database Port: $DB_PORT"
+
+          # Get Database Name
+          DB_NAME=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='DatabaseName'].OutputValue" \
+            --output text)
+          echo "Database Name: $DB_NAME"
+
+          # Get Database Secret ARN
+          DB_SECRET=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='DatabaseSecretArn'].OutputValue" \
+            --output text)
+          echo "Database Secret ARN: $DB_SECRET"
+
+          # Get DB Subnet Group
+          DB_SUBNET_GROUP=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='DBSubnetGroup'].OutputValue" \
+            --output text)
+          echo "DB Subnet Group: $DB_SUBNET_GROUP"
+
+          # Get connection string
+          echo ""
+          echo "Connection String (retrieve from Secrets Manager):"
+          echo "  aws secretsmanager get-secret-value --secret-id $DB_SECRET --query SecretString --output text | jq -r .DATABASE_URL"
+
+          echo ""
+          echo "=========================================="
+          echo "Cost Estimation:"
+          echo "=========================================="
+          case "${{ parameters.dbInstanceClass }}" in
+            "db.t3.micro")
+              echo "RDS Instance: ~\$15/month (free tier eligible)"
+              ;;
+            "db.t3.small")
+              echo "RDS Instance: ~\$30/month"
+              ;;
+            "db.t3.medium")
+              echo "RDS Instance: ~\$60/month"
+              ;;
+            "db.t3.large")
+              echo "RDS Instance: ~\$120/month"
+              ;;
+            "db.r6g.large")
+              echo "RDS Instance: ~\$180/month"
+              ;;
+            "db.r6g.xlarge")
+              echo "RDS Instance: ~\$360/month"
+              ;;
+          esac
+          echo "Storage: ~\$0.10/GB/month (currently ${{ parameters.allocatedStorage }}GB)"
+          echo "Backups: Same rate as storage for backup retention period"
+          if [ "${{ parameters.enableMultiAz }}" = "true" ]; then
+            echo "Multi-AZ: Doubles instance cost"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Next Steps:"
+          echo "=========================================="
+          echo "1. Deploy LiteLLM Stack:"
+          echo "   az pipelines run --name azure-pipelines-litellm --parameters environment=${{ parameters.environment }}"
+          echo ""
+          echo "2. Test database connection from ECS (after LiteLLM deployment)"
+          echo ""
+          if [ "${{ parameters.enableSecretRotation }}" = "true" ]; then
+            echo "3. Monitor secret rotation (rotates every 30 days)"
+            echo ""
+          fi
+          echo "=========================================="
+        failOnStderr: false
