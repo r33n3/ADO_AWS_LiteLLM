@@ -13,7 +13,8 @@ COPY config.yaml /app/config.yaml
 EXPOSE 4000
 
 # Health check - use Python to check health endpoint (no external tools needed)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+# Extended start-period to allow for database migrations and model initialization
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=5 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=5)" || exit 1
 
 # Run LiteLLM proxy with config

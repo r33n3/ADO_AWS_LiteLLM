@@ -302,9 +302,9 @@ Resources:
       HealthCheckPath: /health/liveliness
       HealthCheckProtocol: HTTP
       HealthCheckIntervalSeconds: 30
-      HealthCheckTimeoutSeconds: 10
+      HealthCheckTimeoutSeconds: 15
       HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 3
+      UnhealthyThresholdCount: 5
       Matcher:
         HttpCode: '200'
       TargetGroupAttributes:
