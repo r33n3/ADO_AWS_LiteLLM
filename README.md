@@ -152,9 +152,17 @@ Run pipelines in this specific order:
 
 #### 1. Deploy Security Stack
 - Pipeline: `azure-pipelines-security.yml`
-- What it creates: KMS keys, Secrets Manager, IAM roles, Lambda functions
+- What it creates: KMS keys, Secrets Manager secrets, IAM roles, Lambda functions
 - Parameters: Use defaults (environment: dev, rotationDays: 30)
 - Time: ~5 minutes
+
+**Secrets created:**
+| Secret | Purpose | Rotation |
+|--------|---------|----------|
+| `{env}/litellm/master-key` | API authentication (48-char key) | Auto (30 days) |
+| `{env}/litellm/ui-password` | Admin UI login (separate from API) | Manual |
+| `{env}/litellm/api-keys` | External LLM provider keys | Manual |
+| `{env}/litellm/database` | PostgreSQL credentials | Auto (30 days) |
 
 #### 2. Deploy Network Stack
 - Pipeline: `azure-pipelines-network.yml`
@@ -271,7 +279,7 @@ Estimated monthly costs for **dev environment** (us-east-1, default parameters):
 | ECS Fargate | 1 task, 0.5 vCPU, 1GB | ~$15 |
 | ALB | Internet-facing | ~$16 |
 | KMS Keys | 2 keys | ~$2 |
-| Secrets Manager | 2 secrets | ~$1 |
+| Secrets Manager | 4 secrets | ~$2 |
 | CloudWatch Logs | ~5GB/month | ~$3 |
 | **Total (dev)** | | **~$82/month** |
 
@@ -371,6 +379,8 @@ ADO_LiteLLM_AWS/
 ---
 
 ## Troubleshooting
+
+> **For detailed troubleshooting with debugging commands, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)**
 
 ### "Service connection 'aws-litellm-connection' not found"
 **Solution:** Create the AWS service connection with the exact name `aws-litellm-connection`

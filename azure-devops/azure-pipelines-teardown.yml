@@ -91,23 +91,29 @@ stages:
           echo "Environment: ${{ parameters.environment }}"
           echo ""
 
-          # Find all log groups matching the environment
+          # Find all log groups matching the environment (multiple patterns)
+          # Pattern 1: ECS and general logs ({env}-litellm)
+          # Pattern 2: Lambda logs (/aws/lambda/{env}-litellm)
           LOG_GROUPS=$(aws logs describe-log-groups \
             --region ${{ parameters.awsRegion }} \
-            --query "logGroups[?contains(logGroupName, '${{ parameters.environment }}-litellm')].logGroupName" \
+            --query "logGroups[?contains(logGroupName, '${{ parameters.environment }}-litellm') || contains(logGroupName, '/aws/lambda/${{ parameters.environment }}-litellm')].logGroupName" \
             --output text)
 
+          DELETED_COUNT=0
           if [ -n "$LOG_GROUPS" ]; then
             for LOG_GROUP in $LOG_GROUPS; do
               echo "Deleting log group: $LOG_GROUP"
               aws logs delete-log-group \
                 --log-group-name $LOG_GROUP \
                 --region ${{ parameters.awsRegion }} || true
+              DELETED_COUNT=$((DELETED_COUNT + 1))
             done
             echo ""
-            echo "✓ CloudWatch Log Groups deleted"
+            echo "✓ Deleted $DELETED_COUNT CloudWatch Log Group(s)"
           else
-            echo "No CloudWatch Log Groups found matching pattern: ${{ parameters.environment }}-litellm"
+            echo "No CloudWatch Log Groups found matching patterns:"
+            echo "  - ${{ parameters.environment }}-litellm"
+            echo "  - /aws/lambda/${{ parameters.environment }}-litellm"
           fi
           echo ""
         failOnStderr: false
