@@ -407,8 +407,6 @@ stages:
   - job: CleanupResources
     displayName: 'Cleanup ECR and Logs'
     steps:
-    - checkout: none
-
     - task: AWSShellScript@1
       displayName: 'Delete ECR Repository'
       inputs:
