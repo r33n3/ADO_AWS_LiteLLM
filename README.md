@@ -240,7 +240,42 @@ curl http://YOUR-ALB-ENDPOINT/v1/chat/completions \
   }'
 ```
 
-### 3. Get Database Credentials (If Needed)
+### 3. Get API Master Key
+
+The Master Key is required for API authentication:
+
+```bash
+# Get the Master Key (for API calls)
+aws secretsmanager get-secret-value \
+  --secret-id dev/litellm/master-key \
+  --query SecretString \
+  --output text | jq -r '.LITELLM_MASTER_KEY'
+```
+
+### 4. Access Admin UI
+
+LiteLLM includes a web-based Admin UI for managing models, users, and usage.
+
+**URL:** `http://YOUR-ALB-ENDPOINT/ui`
+
+**Get Admin UI credentials:**
+```bash
+# Get UI username
+aws secretsmanager get-secret-value \
+  --secret-id dev/litellm/ui-password \
+  --query SecretString \
+  --output text | jq -r '.UI_USERNAME'
+
+# Get UI password
+aws secretsmanager get-secret-value \
+  --secret-id dev/litellm/ui-password \
+  --query SecretString \
+  --output text | jq -r '.UI_PASSWORD'
+```
+
+> **Note:** UI credentials are separate from the API Master Key for security. The UI password can be rotated without affecting API clients.
+
+### 5. Get Database Credentials (If Needed)
 
 Database credentials are auto-generated and stored in AWS Secrets Manager:
 
@@ -258,7 +293,7 @@ aws secretsmanager get-secret-value \
   --output text | jq .
 ```
 
-### 4. Configure Custom Domain (Optional)
+### 6. Configure Custom Domain (Optional)
 
 If you deployed with a custom domain:
 
@@ -353,9 +388,16 @@ aws logs delete-log-group --log-group-name /aws/ecs/containerinsights/dev-litell
 ```
 ADO_LiteLLM_AWS/
 ├── README.md                              # This file
+├── QUICK_START.md                         # Fast-track deployment guide
+├── TROUBLESHOOTING.md                     # Common issues and solutions
+├── TAGGING_STRATEGY.md                    # AWS resource tagging guide
 ├── .gitignore                             # Git ignore patterns
 ├── Dockerfile                             # LiteLLM Docker image
 ├── config.yaml                            # LiteLLM configuration
+├── scripts/                               # Operational scripts
+│   ├── monitor-aws-resources.sh           # Monitor deployment status
+│   ├── monitor-ado-pipelines.sh           # Monitor Azure DevOps pipelines
+│   └── teardown-compliance-scan.sh        # Check for orphaned resources
 ├── azure-devops/                          # Azure DevOps pipelines
 │   ├── azure-pipelines-security.yml       # Deploy security infrastructure
 │   ├── azure-pipelines-network.yml        # Deploy VPC and networking
