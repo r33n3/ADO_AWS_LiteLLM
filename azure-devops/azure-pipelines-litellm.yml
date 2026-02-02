@@ -89,6 +89,10 @@ parameters:
   type: string
   default: 'us-east-1'
 
+- name: uiUsername
+  displayName: 'Admin UI Username (password will be the Master Key)'
+  type: string
+  default: 'admin'
 
 - name: costCenter
   displayName: 'Cost Center'
@@ -263,7 +267,7 @@ stages:
       parameters:
         stackName: '$(stackName)'
         templateFile: 'infrastructure/litellm-stack.yaml'
-        parameters: 'Environment=${{ parameters.environment }} ContainerImage=$(GetImageUri.IMAGE_URI) ContainerCpu=${{ parameters.containerCpu }} ContainerMemory=${{ parameters.containerMemory }} DesiredCount=${{ parameters.desiredCount }} EnableAutoScaling=${{ parameters.enableAutoscaling }}'
+        parameters: 'Environment=${{ parameters.environment }} ContainerImage=$(GetImageUri.IMAGE_URI) ContainerCpu=${{ parameters.containerCpu }} ContainerMemory=${{ parameters.containerMemory }} DesiredCount=${{ parameters.desiredCount }} EnableAutoScaling=${{ parameters.enableAutoscaling }} UIUsername=${{ parameters.uiUsername }}'
         capabilities: 'CAPABILITY_IAM'
         awsRegion: '${{ parameters.awsRegion }}'
         awsServiceConnection: 'aws-litellm-connection'
