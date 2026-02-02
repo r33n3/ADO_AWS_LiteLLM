@@ -167,6 +167,41 @@ Resources:
           Value: 'true'
 
   #############################################################################
+  # Secrets Manager - UI Password (separate from Master Key for security)
+  #############################################################################
+  UIPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${Environment}/litellm/ui-password'
+      Description: LiteLLM Admin UI password (separate from API Master Key)
+      KmsKeyId: !Ref LiteLLMEncryptionKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"UI_USERNAME": "admin"}'
+        GenerateStringKey: UI_PASSWORD
+        PasswordLength: 24
+        ExcludeCharacters: '"@/\'
+        RequireEachIncludedType: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-litellm-ui-password'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: litellm
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Project
+          Value: !Ref Project
+        - Key: Compliance
+          Value: !Ref Compliance
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: RotationEnabled
+          Value: 'true'
+
+  #############################################################################
   # Secrets Manager - API Keys (OpenAI, Anthropic, etc.)
   #############################################################################
   ApiKeysSecret:
@@ -479,6 +514,7 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Ref MasterKeySecret
+                  - !Ref UIPasswordSecret
                   - !Ref ApiKeysSecret
                   - !Ref DatabaseSecret
               - Sid: KMSDecrypt
@@ -552,6 +588,7 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Ref MasterKeySecret
+                  - !Ref UIPasswordSecret
                   - !Ref ApiKeysSecret
                   - !Ref DatabaseSecret
       Tags:
@@ -619,6 +656,12 @@ Outputs:
     Value: !Ref MasterKeySecret
     Export:
       Name: !Sub '${Environment}-litellm-master-key-arn'
+
+  UIPasswordSecretArn:
+    Description: ARN of the UI Password secret
+    Value: !Ref UIPasswordSecret
+    Export:
+      Name: !Sub '${Environment}-litellm-ui-password-arn'
 
   ApiKeysSecretArn:
     Description: ARN of the API Keys secret

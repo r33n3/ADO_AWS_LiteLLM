@@ -92,11 +92,6 @@ Parameters:
       - 365
     Description: CloudWatch log retention period
 
-  UIUsername:
-    Type: String
-    Default: admin
-    Description: Username for LiteLLM Admin UI login (password is the Master Key)
-
   CostCenter:
     Type: String
     Default: engineering
@@ -225,19 +220,22 @@ Resources:
               Value: PRODUCTION
             - Name: UI_ACCESS_MODE
               Value: admin_ui
-            - Name: UI_USERNAME
-              Value: !Ref UIUsername
           Secrets:
             - Name: LITELLM_MASTER_KEY
               ValueFrom: !Sub
                 - '${SecretArn}:LITELLM_MASTER_KEY::'
                 - SecretArn: !ImportValue
                     Fn::Sub: '${Environment}-litellm-master-key-arn'
+            - Name: UI_USERNAME
+              ValueFrom: !Sub
+                - '${SecretArn}:UI_USERNAME::'
+                - SecretArn: !ImportValue
+                    Fn::Sub: '${Environment}-litellm-ui-password-arn'
             - Name: UI_PASSWORD
               ValueFrom: !Sub
-                - '${SecretArn}:LITELLM_MASTER_KEY::'
+                - '${SecretArn}:UI_PASSWORD::'
                 - SecretArn: !ImportValue
-                    Fn::Sub: '${Environment}-litellm-master-key-arn'
+                    Fn::Sub: '${Environment}-litellm-ui-password-arn'
             - Name: OPENAI_API_KEY
               ValueFrom: !Sub
                 - '${SecretArn}:OPENAI_API_KEY::'
