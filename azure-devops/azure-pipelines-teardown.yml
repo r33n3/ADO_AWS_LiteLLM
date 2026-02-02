@@ -507,21 +507,27 @@ stages:
           echo "Compliance scan completed"
           echo ""
 
-          # Show the report file name
+          # Show the report file name and copy to fixed name for artifact upload
           REPORT_FILE=$(ls -t teardown-compliance-report-*.md 2>/dev/null | head -1)
           if [ -n "$REPORT_FILE" ]; then
             echo "Compliance report generated: $REPORT_FILE"
             echo ""
             echo "Report summary:"
             tail -20 "$REPORT_FILE"
+            # Copy to fixed name for artifact publishing
+            cp "$REPORT_FILE" compliance-report.md
+            echo "##vso[task.setvariable variable=REPORT_EXISTS]true"
+          else
+            echo "No compliance report generated"
+            echo "##vso[task.setvariable variable=REPORT_EXISTS]false"
           fi
         failOnStderr: false
 
     - task: PublishBuildArtifacts@1
       displayName: 'Upload Compliance Report'
-      condition: eq('${{ parameters.stack }}', 'all')
+      condition: and(eq('${{ parameters.stack }}', 'all'), eq(variables.REPORT_EXISTS, 'true'))
       inputs:
-        PathtoPublish: 'teardown-compliance-report-*.md'
+        PathtoPublish: 'compliance-report.md'
         ArtifactName: 'ComplianceReport'
         publishLocation: 'Container'
       continueOnError: true
